@@ -68,6 +68,7 @@ static uint64_t mem_account_now_us() {
 struct mem_account_buffer {
     uint64_t id = 0;
     uint64_t backing_id = 0;
+    uint64_t buffer_type_id = 0;
     uint64_t started_us = 0;
     std::string type;
     size_t bytes = 0;
@@ -96,6 +97,7 @@ struct mem_account_state {
     uint64_t next_id = 1;
     std::unordered_map<const void *, mem_account_buffer> buffers;
     std::unordered_map<const void *, mem_account_backing> backings;
+    std::unordered_map<const void *, uint64_t> buffer_types;
     std::unordered_set<const void *> external_types;
     size_t physical_live = 0;
     size_t physical_peak = 0;
@@ -138,6 +140,13 @@ static void mem_account_buffer_created(const void * token, const void * buft,
     b.id = s.next_id++;
     b.started_us = mem_account_now_us();
     b.type = type ? type : "unknown";
+    auto bt = s.buffer_types.find(buft);
+    if (bt == s.buffer_types.end()) {
+        b.buffer_type_id = s.next_id++;
+        s.buffer_types.emplace(buft, b.buffer_type_id);
+    } else {
+        b.buffer_type_id = bt->second;
+    }
     b.bytes = bytes;
     b.external = s.external_types.count(buft) != 0;
     b.physical_owner = owns_storage && !b.external;
@@ -330,10 +339,10 @@ void ggml_mem_account_snapshot(const char * stage) {
         s.buffers.size(), (unsigned long long)s.alloc_count, (unsigned long long)s.free_count,
         (double)s.write_bytes/(1024*1024), (unsigned long long)s.write_calls);
     struct usage_row { size_t buffers=0, bytes=0, physical=0, weights=0; };
-    std::map<std::string, usage_row> by_type;
+    std::map<std::pair<std::string, uint64_t>, usage_row> by_type;
     for (const auto & kv : s.buffers) {
         const auto & b = kv.second;
-        auto & row = by_type[b.type];
+        auto & row = by_type[{b.type, b.buffer_type_id}];
         row.buffers++;
         row.bytes += b.bytes;
         if (b.physical_owner) row.physical += b.bytes;
@@ -342,8 +351,9 @@ void ggml_mem_account_snapshot(const char * stage) {
     for (const auto & kv : by_type) {
         const auto & v = kv.second;
         std::fprintf(stderr,
-            "[MEM-ACCOUNT-BUFT] stage=%s type=%s buffers=%zu logical=%.2fMiB physical_unique=%.2fMiB marked_weights=%.2fMiB\n",
-            label, kv.first.c_str(), v.buffers, (double)v.bytes/(1024*1024),
+            "[MEM-ACCOUNT-BUFT] stage=%s type=%s buft_id=%llu buffers=%zu logical=%.2fMiB physical_unique=%.2fMiB marked_weights=%.2fMiB\n",
+            label, kv.first.first.c_str(), (unsigned long long)kv.first.second,
+            v.buffers, (double)v.bytes/(1024*1024),
             (double)v.physical/(1024*1024), (double)v.weights/(1024*1024));
     }
     for (const auto & kv : s.backings) {
