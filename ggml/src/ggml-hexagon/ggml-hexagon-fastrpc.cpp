@@ -7769,6 +7769,8 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     // Persistent weight mirror regions: not freed after each call, surviving across
     // graph_compute calls so cached weight data stays valid in the mempool.
     std::vector<size_t>         persistent_region_indices;
+    size_t batch_new_persistent_mirror_bytes = 0;
+    size_t batch_temp_mirror_bytes = 0;
 
     // Storage for cache-miss path; on cache hit we reference cached vectors
     // directly to avoid copying ~20-110 KB of descriptors per call.
@@ -8676,8 +8678,10 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         ctx->ion_regions.push_back(mirror_region);
         if (is_weight_mirror) {
             persistent_region_indices.push_back(ctx->ion_regions.size() - 1);
+            batch_new_persistent_mirror_bytes += mirror_size;
         } else {
             temp_region_indices.push_back(ctx->ion_regions.size() - 1);
+            batch_temp_mirror_bytes += mirror_size;
         }
 
         memcpy(ion_buf, data_ptr, mirror_size);
@@ -8889,6 +8893,8 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
     uint32_t batch_offset = (uint32_t)batch_offset_aligned;
     ctx->rpc_mempool_usage = batch_offset_aligned + total_desc_size;
     ggml_mem_account_pool_high_water(ctx->rpc_mempool, ctx->rpc_mempool_usage);
+    ggml_mem_account_pool_graph_regions(ctx->rpc_mempool,
+        batch_new_persistent_mirror_bytes, batch_temp_mirror_bytes, total_desc_size);
     // Record batch descriptor as a temporary mempool region
     ion_pool_region batch_region;
     batch_region.offset = batch_offset_aligned;
