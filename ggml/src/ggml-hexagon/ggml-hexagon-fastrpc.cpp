@@ -73,6 +73,7 @@
 
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-backend-impl.h"
+#include "ggml-mem-snapshot.h"
 #include "ggml-alloc.h"
 #include "ggml-common.h"
 #include "ggml-hexagon.h"
@@ -613,6 +614,13 @@ void ggmlhexagon_log_always_internal(int level, const char * file, const char * 
 #endif
         }
         va_end(args);
+    }
+}
+
+static void ggmlhexagon_mem_snapshot(const std::string & stage) {
+    const std::string snapshot = ggml_mem_snapshot(stage);
+    if (!snapshot.empty()) {
+        GGMLHEXAGON_LOG_ALWAYS("%s", snapshot.c_str());
     }
 }
 
@@ -1890,6 +1898,7 @@ static int ggmlhexagon_init_rpcmempool(ggml_backend_hexagon_context * ctx) {
     size_t * targets        = (htp_arch > 75) ? targets_79plus : targets_legacy;
     size_t   n_targets      = (htp_arch > 75) ? sizeof(targets_79plus) / sizeof(targets_79plus[0])
                                        : sizeof(targets_legacy) / sizeof(targets_legacy[0]);
+    ggmlhexagon_mem_snapshot("before_rpcmem:HTP" + std::to_string(ctx->device));
     for (size_t i = 0; i < n_targets; i++) {
         size_t pool_size = targets[i] - 8;
         uint8_t * buf = static_cast<uint8_t *>(rpcmem_alloc2(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, pool_size * SIZE_IN_MB));
@@ -1897,6 +1906,7 @@ static int ggmlhexagon_init_rpcmempool(ggml_backend_hexagon_context * ctx) {
             ctx->rpc_mempool          = buf;
             ctx->rpc_mempool_capacity = targets[i] * SIZE_IN_MB;
             ctx->rpc_mempool_len      = pool_size * SIZE_IN_MB;
+            ggmlhexagon_mem_snapshot("after_rpcmem_alloc:HTP" + std::to_string(ctx->device));
             GGMLHEXAGON_LOG_ALWAYS("rpc mempool: %zu MiB allocated (target %zu MiB, device %d)",
                                     pool_size, targets[i], ctx->device);
             goto mempool_acquired;
@@ -1956,6 +1966,7 @@ mempool_acquired:
     GGMLHEXAGON_LOG_ALWAYS("registered mempool base via scalar call: fd=%d, size=%zu MB, time=%lld us",
                             ctx->rpc_mempool_handle, ctx->rpc_mempool_len / SIZE_IN_MB, (long long)dt_reg);
     GGMLHEXAGON_LOG_ALWAYS("mempool layout: total=%zuMB", ctx->rpc_mempool_len / SIZE_IN_MB);
+    ggmlhexagon_mem_snapshot("after_rpcmem_register:HTP" + std::to_string(ctx->device));
     // Prime the RPC overhead profiler with a few no-op warmup calls to get
     // a meaningful min/max/avg distribution without polluting the pool.
     for (int i = 0; i < 6; i++) {
@@ -1966,12 +1977,14 @@ mempool_acquired:
 
 static void ggmlhexagon_deinit_rpcmempool(ggml_backend_hexagon_context * ctx) {
     if (ctx->rpc_mempool) {
+        ggmlhexagon_mem_snapshot("before_rpcmem_free:HTP" + std::to_string(ctx->device));
         GGMLHEXAGON_LOG_DEBUG("free rpc mempool %p", ctx->rpc_mempool);
         fastrpc_munmap(ctx->domain_id, ctx->rpc_mempool_handle, ctx->rpc_mempool, ctx->rpc_mempool_len);
         rpcmem_free(ctx->rpc_mempool);
         ctx->rpc_mempool            = nullptr;
         ctx->rpc_mempool_len        = 0;
         ctx->rpc_mempool_capacity   = 0;
+        ggmlhexagon_mem_snapshot("after_rpcmem_free:HTP" + std::to_string(ctx->device));
     }
 }
 
@@ -7251,6 +7264,11 @@ static const char * ggml_backend_hexagon_buffer_type_name(ggml_backend_buffer_ty
 static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     struct ggml_backend_hexagon_context * ctx = static_cast<ggml_backend_hexagon_context *>(buft->context);
     GGML_ASSERT(nullptr != ctx);
+    const bool large_alloc = size >= 256 * SIZE_IN_MB;
+    const std::string alloc_stage = "HTP" + std::to_string(ctx->device) + ":sizeMiB=" + std::to_string(size / SIZE_IN_MB);
+    if (large_alloc) {
+        ggmlhexagon_mem_snapshot("before_large_htp_alloc:" + alloc_stage);
+    }
     GGMLHEXAGON_LOG_ALWAYS("[ALLOC] ENTER device=%d size=%zu bytes (%.2f MiB)", ctx->device, size, (double)size / (1024.0 * 1024.0));
     ggml_backend_hexagon_buffer_context * buffer_ctx = new ggml_backend_hexagon_buffer_context;
     buffer_ctx->backend_ctx = ctx;
@@ -7367,8 +7385,11 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
                 }
             }
 #endif
+            ggmlhexagon_mem_snapshot("before_cpu_fallback:" + alloc_stage);
             delete buffer_ctx;
-            return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size_aligned);
+            ggml_backend_buffer_t host_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size_aligned);
+            ggmlhexagon_mem_snapshot("after_cpu_fallback:" + alloc_stage);
+            return host_buffer;
         }
     }
 
@@ -7395,6 +7416,9 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
                              ctx->rpc_mempool_len > 0 ? (double)ctx->rpc_mempool_usage * 100.0 / ctx->rpc_mempool_len : 0.0);
     } else {
         GGMLHEXAGON_LOG_ALWAYS("[ALLOC] device=%d LEAVE size=%zu (%.2f MiB) -> heap", ctx->device, size, (double)size / (1024.0 * 1024.0));
+    }
+    if (large_alloc) {
+        ggmlhexagon_mem_snapshot("after_large_htp_alloc:" + alloc_stage);
     }
     return ggml_backend_buffer_init(buft, ggml_backend_hexagon_buffer_interface, buffer_ctx, size);
 }
