@@ -89,6 +89,10 @@ struct mem_account_backing {
     size_t high_water = 0;
     size_t mapping_registrations = 0;
     size_t peak_mapping_registrations = 0;
+    size_t persistent_mirrors_alloc_total = 0;
+    size_t temp_mirrors_peak = 0;
+    size_t descriptors_peak = 0;
+    uint64_t graph_samples = 0;
     uint64_t started_us = 0;
 };
 
@@ -327,6 +331,20 @@ void ggml_mem_account_pool_high_water(const void * token, size_t bytes) {
     it->second.high_water = std::max(it->second.high_water, bytes);
 }
 
+void ggml_mem_account_pool_graph_regions(const void * token,
+        size_t persistent_mirror_new_bytes, size_t temporary_mirror_bytes, size_t descriptor_bytes) {
+    if (!mem_account_enabled()) return;
+    auto & s = mem_account_get_state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    auto it = s.backings.find(token);
+    if (it == s.backings.end()) return;
+    auto & p = it->second;
+    p.persistent_mirrors_alloc_total += persistent_mirror_new_bytes;
+    p.temp_mirrors_peak = std::max(p.temp_mirrors_peak, temporary_mirror_bytes);
+    p.descriptors_peak = std::max(p.descriptors_peak, descriptor_bytes);
+    p.graph_samples++;
+}
+
 void ggml_mem_account_snapshot(const char * stage) {
     if (!mem_account_enabled()) return;
     auto & s = mem_account_get_state();
@@ -359,10 +377,15 @@ void ggml_mem_account_snapshot(const char * stage) {
     for (const auto & kv : s.backings) {
         const auto & p = kv.second;
         std::fprintf(stderr,
-            "[MEM-ACCOUNT-BACKING] stage=%s id=%llu type=%s allocated=%.2fMiB children_live=%.2fMiB children_peak=%.2fMiB bump_hwm=%.2fMiB mapping_registrations=%zu\n",
+            "[MEM-ACCOUNT-BACKING] stage=%s id=%llu type=%s allocated=%.2fMiB children_live=%.2fMiB children_peak=%.2fMiB bump_hwm=%.2fMiB mapping_registrations=%zu"
+            " persistent_mirror_alloc_total=%.2fMiB temp_mirror_peak=%.2fMiB desc_peak=%.2fMiB graph_samples=%llu\n",
             label, (unsigned long long)p.id, p.name.c_str(), (double)p.bytes/(1024*1024),
             (double)p.live_children/(1024*1024), (double)p.peak_children/(1024*1024),
-            (double)p.high_water/(1024*1024), p.mapping_registrations);
+            (double)p.high_water/(1024*1024), p.mapping_registrations,
+            (double)p.persistent_mirrors_alloc_total/(1024*1024),
+            (double)p.temp_mirrors_peak/(1024*1024),
+            (double)p.descriptors_peak/(1024*1024),
+            (unsigned long long)p.graph_samples);
     }
 }
 
