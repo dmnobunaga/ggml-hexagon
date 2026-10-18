@@ -1,4 +1,5 @@
 #include "llama-model-loader.h"
+#include "ggml-mem-snapshot.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -1550,6 +1551,13 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
     return data;
 }
 
+static void llama_loader_mem_snapshot(const std::string & stage) {
+    const std::string snapshot = ggml_mem_snapshot(stage);
+    if (!snapshot.empty()) {
+        LLAMA_LOG_INFO("%s\n", snapshot.c_str());
+    }
+}
+
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         std::vector<ggml_backend_buffer_t> & bufs,
@@ -1801,10 +1809,24 @@ bool llama_model_loader::load_all_data(
                     }
                 } else {
                     // scoped to one tensor so only one staging buffer is alive at a time
+                    const bool probe_staging = n_size >= 128ull * 1024 * 1024;
+                    const std::string tensor_stage = std::string(ggml_get_name(cur)) + ":sizeMiB=" + std::to_string(n_size / (1024 * 1024));
+                    if (probe_staging) {
+                        llama_loader_mem_snapshot("before_staging:" + tensor_stage);
+                    }
                     std::vector<no_init<uint8_t>> read_buf(n_size);
+                    if (probe_staging) {
+                        llama_loader_mem_snapshot("after_staging_alloc:" + tensor_stage);
+                    }
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(read_buf.data(), n_size);
+                    if (probe_staging) {
+                        llama_loader_mem_snapshot("after_staging_read:" + tensor_stage);
+                    }
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+                    if (probe_staging) {
+                        llama_loader_mem_snapshot("after_staging_upload:" + tensor_stage);
+                    }
                     if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                     }
