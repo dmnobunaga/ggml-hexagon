@@ -24,6 +24,7 @@
 
 #include "ggml.h"
 #include "ggml-mem-snapshot.h"
+#include "ggml-mem-account.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -2092,6 +2093,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         llama_model_mem_snapshot(std::string("after_model_buffer:") + ggml_backend_buft_name(buft));
     }
     llama_model_mem_snapshot("after_model_buffers");
+    ggml_mem_account_snapshot("model_buffers_allocated");
 
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, n_layer_all);
@@ -2141,6 +2143,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         llama_model_mem_snapshot("after_load_all_data:" + group);
     }
     llama_model_mem_snapshot("after_load_all_data");
+    ggml_mem_account_snapshot("model_weights_loaded");
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
