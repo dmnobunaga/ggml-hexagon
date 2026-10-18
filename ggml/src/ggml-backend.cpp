@@ -108,8 +108,10 @@ struct mem_account_state {
 };
 
 static mem_account_state & mem_account_get_state() {
-    static mem_account_state state;
-    return state;
+    // Intentionally process-lifetime: backend registry destructors can release
+    // RPCMEM after normal C++ static destruction has begun.
+    static mem_account_state * const state = new mem_account_state;
+    return *state;
 }
 
 static void mem_account_peak(mem_account_state & s) {
