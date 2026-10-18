@@ -10,6 +10,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-mem-account.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -20,7 +21,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __APPLE__
@@ -28,6 +34,322 @@
 #include <sys/sysctl.h>
 #endif
 
+
+
+// Opt-in backend buffer accounting. A child of a shared backing is not a
+// second physical allocation. Mapping registrations are tracked separately.
+// This measures backend buffer capacity, NOT physical RSS or page residency.
+namespace {
+
+static bool mem_account_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("GGML_MEM_ACCOUNTING");
+        return v && std::strcmp(v, "1") == 0;
+    }();
+    return enabled;
+}
+
+static bool mem_account_verbose() {
+    static const bool verbose = [] {
+        const char * v = std::getenv("GGML_MEM_ACCOUNT_VERBOSE");
+        return v && std::strcmp(v, "1") == 0;
+    }();
+    return verbose;
+}
+
+static uint64_t mem_account_now_us() {
+    using namespace std::chrono;
+    return (uint64_t) duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+struct mem_account_buffer {
+    uint64_t id = 0;
+    uint64_t backing_id = 0;
+    uint64_t started_us = 0;
+    std::string type;
+    size_t bytes = 0;
+    size_t offset = 0;
+    size_t writes = 0;
+    uint64_t write_calls = 0;
+    bool physical_owner = false;
+    bool external = false;
+    bool weights = false;
+};
+
+struct mem_account_backing {
+    uint64_t id = 0;
+    std::string name;
+    size_t bytes = 0;
+    size_t live_children = 0;
+    size_t peak_children = 0;
+    size_t high_water = 0;
+    size_t mapping_registrations = 0;
+    size_t peak_mapping_registrations = 0;
+    uint64_t started_us = 0;
+};
+
+struct mem_account_state {
+    std::mutex mu;
+    uint64_t next_id = 1;
+    std::unordered_map<const void *, mem_account_buffer> buffers;
+    std::unordered_map<const void *, mem_account_backing> backings;
+    std::unordered_set<const void *> external_types;
+    size_t physical_live = 0;
+    size_t physical_peak = 0;
+    size_t parent_live = 0;
+    size_t children_peak = 0;
+    uint64_t alloc_count = 0;
+    uint64_t free_count = 0;
+    uint64_t write_calls = 0;
+    uint64_t write_bytes = 0;
+};
+
+static mem_account_state & mem_account_get_state() {
+    static mem_account_state state;
+    return state;
+}
+
+static void mem_account_peak(mem_account_state & s) {
+    if (s.physical_live > s.physical_peak) {
+        s.physical_peak = s.physical_live;
+    }
+    size_t child_total = 0;
+    for (const auto & kv : s.backings) {
+        child_total += kv.second.live_children;
+    }
+    if (child_total > s.children_peak) {
+        s.children_peak = child_total;
+    }
+}
+
+static void mem_account_buffer_created(const void * token, const void * buft,
+        const char * type, size_t bytes, bool owns_storage) {
+    if (!mem_account_enabled()) {
+        return;
+    }
+    auto & s = mem_account_get_state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    mem_account_buffer b;
+    b.id = s.next_id++;
+    b.started_us = mem_account_now_us();
+    b.type = type ? type : "unknown";
+    b.bytes = bytes;
+    b.external = s.external_types.count(buft) != 0;
+    b.physical_owner = owns_storage && !b.external;
+    b.backing_id = b.physical_owner ? b.id : 0;
+    s.buffers[token] = b;
+    s.alloc_count++;
+    if (b.physical_owner) {
+        s.physical_live += bytes;
+        mem_account_peak(s);
+    }
+    if (mem_account_verbose()) {
+        std::fprintf(stderr,
+            "[MEM-ACCOUNT-EVENT] alloc id=%llu backing=%llu type=%s bytes=%zu owner=%d external=%d\n",
+            (unsigned long long)b.id, (unsigned long long)b.backing_id,
+            b.type.c_str(), bytes, (int)b.physical_owner, (int)b.external);
+    }
+}
+
+static void mem_account_buffer_freed(const void * token) {
+    if (!mem_account_enabled()) {
+        return;
+    }
+    auto & s = mem_account_get_state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    auto it = s.buffers.find(token);
+    if (it == s.buffers.end()) {
+        return;
+    }
+    const mem_account_buffer & b = it->second;
+    if (b.physical_owner) {
+        s.physical_live -= b.bytes;
+    }
+    if (b.external && b.backing_id != 0) {
+        for (auto & kv : s.backings) {
+            if (kv.second.id == b.backing_id) {
+                const size_t n = b.bytes > kv.second.live_children ? kv.second.live_children : b.bytes;
+                kv.second.live_children -= n;
+                break;
+            }
+        }
+    }
+    s.free_count++;
+    if (mem_account_verbose()) {
+        std::fprintf(stderr,
+            "[MEM-ACCOUNT-EVENT] free id=%llu backing=%llu bytes=%zu lived_ms=%.1f\n",
+            (unsigned long long)b.id, (unsigned long long)b.backing_id, b.bytes,
+            (double)(mem_account_now_us() - b.started_us) / 1000.);
+    }
+    s.buffers.erase(it);
+}
+
+static void mem_account_buffer_written(const void * token, size_t bytes) {
+    if (!mem_account_enabled()) {
+        return;
+    }
+    auto & s = mem_account_get_state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    auto it = s.buffers.find(token);
+    if (it != s.buffers.end()) {
+        it->second.writes += bytes;
+        it->second.write_calls++;
+    }
+    s.write_bytes += bytes;
+    s.write_calls++;
+}
+
+static void mem_account_buffer_usage(const void * token, bool weights) {
+    if (!mem_account_enabled()) {
+        return;
+    }
+    auto & s = mem_account_get_state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    auto it = s.buffers.find(token);
+    if (it != s.buffers.end()) {
+        it->second.weights = weights;
+    }
+}
+
+} // namespace
+
+void ggml_mem_account_external_buffer_type(const void * buft) {
+    if (!mem_account_enabled()) return;
+    auto & s = mem_account_get_state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    s.external_types.insert(buft);
+}
+
+void ggml_mem_account_pool_create(const void * token, const char * name, size_t allocated_bytes) {
+    if (!mem_account_enabled()) return;
+    auto & s = mem_account_get_state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    if (s.backings.count(token)) {
+        std::fprintf(stderr, "[MEM-ACCOUNT] WARNING duplicate physical backing token=%p\n", token);
+        return;
+    }
+    mem_account_backing b;
+    b.id = s.next_id++;
+    b.started_us = mem_account_now_us();
+    b.name = name ? name : "external";
+    b.bytes = allocated_bytes;
+    s.backings.emplace(token, b);
+    s.physical_live += allocated_bytes;
+    s.parent_live += allocated_bytes;
+    mem_account_peak(s);
+    if (mem_account_verbose()) {
+        std::fprintf(stderr, "[MEM-ACCOUNT-EVENT] backing_alloc id=%llu type=%s bytes=%zu\n",
+            (unsigned long long)b.id, b.name.c_str(), allocated_bytes);
+    }
+}
+
+void ggml_mem_account_pool_destroy(const void * token) {
+    if (!mem_account_enabled()) return;
+    auto & s = mem_account_get_state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    auto it = s.backings.find(token);
+    if (it == s.backings.end()) return;
+    const mem_account_backing & b = it->second;
+    if (b.live_children || b.mapping_registrations) {
+        std::fprintf(stderr, "[MEM-ACCOUNT] WARNING backing=%llu freed with children=%zu mappings=%zu\n",
+            (unsigned long long)b.id, b.live_children, b.mapping_registrations);
+    }
+    if (mem_account_verbose()) {
+        std::fprintf(stderr, "[MEM-ACCOUNT-EVENT] backing_free id=%llu bytes=%zu lived_ms=%.1f\n",
+            (unsigned long long)b.id, b.bytes, (double)(mem_account_now_us()-b.started_us)/1000.);
+    }
+    s.physical_live -= b.bytes;
+    s.parent_live -= b.bytes;
+    s.backings.erase(it);
+}
+
+void ggml_mem_account_buffer_attach(const void * buffer, const void * token, size_t offset, size_t bytes) {
+    if (!mem_account_enabled()) return;
+    auto & s = mem_account_get_state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    auto bit = s.buffers.find(buffer);
+    auto pit = s.backings.find(token);
+    if (bit == s.buffers.end() || pit == s.backings.end()) {
+        std::fprintf(stderr, "[MEM-ACCOUNT] WARNING untracked child/backing in attach\n");
+        return;
+    }
+    auto & b = bit->second;
+    auto & p = pit->second;
+    if (!b.external || b.backing_id || offset > p.bytes || bytes > p.bytes - offset) {
+        std::fprintf(stderr, "[MEM-ACCOUNT] WARNING invalid backing relationship for buffer=%llu\n",
+            (unsigned long long)b.id);
+        return;
+    }
+    b.backing_id = p.id;
+    b.offset = offset;
+    b.bytes = bytes;
+    p.live_children += bytes;
+    if (p.live_children > p.peak_children) p.peak_children = p.live_children;
+    mem_account_peak(s);
+    if (mem_account_verbose()) {
+        std::fprintf(stderr, "[MEM-ACCOUNT-EVENT] suballoc id=%llu backing=%llu offset=%zu bytes=%zu\n",
+            (unsigned long long)b.id, (unsigned long long)p.id, offset, bytes);
+    }
+}
+
+void ggml_mem_account_mapping_change(const void * token, int delta) {
+    if (!mem_account_enabled()) return;
+    auto & s = mem_account_get_state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    auto it = s.backings.find(token);
+    if (it == s.backings.end()) return;
+    auto & p = it->second;
+    if (delta > 0) p.mapping_registrations += (size_t)delta;
+    if (delta < 0) p.mapping_registrations -= std::min(p.mapping_registrations, (size_t)(-delta));
+    p.peak_mapping_registrations = std::max(p.peak_mapping_registrations, p.mapping_registrations);
+}
+
+void ggml_mem_account_pool_high_water(const void * token, size_t bytes) {
+    if (!mem_account_enabled()) return;
+    auto & s = mem_account_get_state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    auto it = s.backings.find(token);
+    if (it == s.backings.end()) return;
+    it->second.high_water = std::max(it->second.high_water, bytes);
+}
+
+void ggml_mem_account_snapshot(const char * stage) {
+    if (!mem_account_enabled()) return;
+    auto & s = mem_account_get_state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    const char * label = stage ? stage : "unspecified";
+    std::fprintf(stderr,
+        "[MEM-ACCOUNT] stage=%s physical_live=%.2fMiB physical_peak=%.2fMiB pool_live=%.2fMiB active_pool_suballoc_peak=%.2fMiB buffers=%zu allocs=%llu frees=%llu writes=%.2fMiB calls=%llu\n",
+        label, (double)s.physical_live/(1024*1024), (double)s.physical_peak/(1024*1024),
+        (double)s.parent_live/(1024*1024), (double)s.children_peak/(1024*1024),
+        s.buffers.size(), (unsigned long long)s.alloc_count, (unsigned long long)s.free_count,
+        (double)s.write_bytes/(1024*1024), (unsigned long long)s.write_calls);
+    struct usage_row { size_t buffers=0, bytes=0, physical=0, weights=0; };
+    std::map<std::string, usage_row> by_type;
+    for (const auto & kv : s.buffers) {
+        const auto & b = kv.second;
+        auto & row = by_type[b.type];
+        row.buffers++;
+        row.bytes += b.bytes;
+        if (b.physical_owner) row.physical += b.bytes;
+        if (b.weights) row.weights += b.bytes;
+    }
+    for (const auto & kv : by_type) {
+        const auto & v = kv.second;
+        std::fprintf(stderr,
+            "[MEM-ACCOUNT-BUFT] stage=%s type=%s buffers=%zu logical=%.2fMiB physical_unique=%.2fMiB marked_weights=%.2fMiB\n",
+            label, kv.first.c_str(), v.buffers, (double)v.bytes/(1024*1024),
+            (double)v.physical/(1024*1024), (double)v.weights/(1024*1024));
+    }
+    for (const auto & kv : s.backings) {
+        const auto & p = kv.second;
+        std::fprintf(stderr,
+            "[MEM-ACCOUNT-BACKING] stage=%s id=%llu type=%s allocated=%.2fMiB children_live=%.2fMiB children_peak=%.2fMiB bump_hwm=%.2fMiB mapping_registrations=%zu\n",
+            label, (unsigned long long)p.id, p.name.c_str(), (double)p.bytes/(1024*1024),
+            (double)p.live_children/(1024*1024), (double)p.peak_children/(1024*1024),
+            (double)p.high_water/(1024*1024), p.mapping_registrations);
+    }
+}
 
 // backend buffer type
 
@@ -246,6 +568,11 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
         /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY
     };
 
+    if (mem_account_enabled()) {
+        const bool owns_storage = size > 0 && iface.free_buffer != nullptr &&
+            iface.get_base != nullptr;
+        mem_account_buffer_created(buffer, buft, ggml_backend_buft_name(buft), size, owns_storage);
+    }
     return buffer;
 }
 
@@ -258,6 +585,7 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
         return;
     }
 
+    mem_account_buffer_freed(buffer);
     if (buffer->iface.free_buffer != NULL) {
         buffer->iface.free_buffer(buffer);
     }
@@ -327,6 +655,7 @@ bool ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) {
 void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(buffer);
     buffer->usage = usage;
+    mem_account_buffer_usage(buffer, usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
     // FIXME: add a generic callback to the buffer interface
     if (ggml_backend_buffer_is_multi_buffer(buffer)) {
@@ -485,6 +814,7 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
     buf->iface.set_tensor(buf, tensor, data, offset, size);
+    mem_account_buffer_written(buf, size);
 }
 
 void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
