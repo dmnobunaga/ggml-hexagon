@@ -22,6 +22,9 @@
 #include <string.h>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
