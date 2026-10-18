@@ -18,6 +18,7 @@
 namespace ggml_mem_snapshot_detail {
 
 struct metrics {
+    long long mem_total = -1;
     long long mem_available = -1;
     long long mem_free = -1;
     long long cached = -1;
@@ -32,6 +33,14 @@ struct metrics {
     long long rss_shmem = -1;
     long long vm_swap = -1;
     long long pss = -1;
+    long long rollup_rss = -1;
+    long long private_clean = -1;
+    long long private_dirty = -1;
+    long long shared_clean = -1;
+    long long shared_dirty = -1;
+    long long swap_pss = -1;
+    long long ion_total_used = -1;
+    long long ion_total_cache = -1;
     long long dmabuf_kib = -1;
     long long dmabuf_count = -1;
 };
@@ -48,7 +57,8 @@ inline void load_proc_file(const char * path, metrics & m) {
         if (std::sscanf(line, " %63[^:]: %lld", key, &val) != 2) {
             continue;
         }
-        if      (!std::strcmp(key, "MemAvailable")) m.mem_available = val;
+        if      (!std::strcmp(key, "MemTotal"))     m.mem_total = val;
+        else if (!std::strcmp(key, "MemAvailable")) m.mem_available = val;
         else if (!std::strcmp(key, "MemFree"))      m.mem_free = val;
         else if (!std::strcmp(key, "Cached"))       m.cached = val;
         else if (!std::strcmp(key, "Shmem"))        m.shmem = val;
@@ -62,6 +72,14 @@ inline void load_proc_file(const char * path, metrics & m) {
         else if (!std::strcmp(key, "RssShmem"))     m.rss_shmem = val;
         else if (!std::strcmp(key, "VmSwap"))       m.vm_swap = val;
         else if (!std::strcmp(key, "Pss"))          m.pss = val;
+        else if (!std::strcmp(key, "Rss"))          m.rollup_rss = val;
+        else if (!std::strcmp(key, "Private_Clean")) m.private_clean = val;
+        else if (!std::strcmp(key, "Private_Dirty")) m.private_dirty = val;
+        else if (!std::strcmp(key, "Shared_Clean"))  m.shared_clean = val;
+        else if (!std::strcmp(key, "Shared_Dirty"))  m.shared_dirty = val;
+        else if (!std::strcmp(key, "SwapPss"))       m.swap_pss = val;
+        else if (!std::strcmp(key, "IonTotalUsed"))  m.ion_total_used = val;
+        else if (!std::strcmp(key, "IonTotalCache")) m.ion_total_cache = val;
     }
     std::fclose(f);
 }
@@ -120,19 +138,25 @@ inline std::string ggml_mem_snapshot(const std::string & stage) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     const long long t_ms = (long long) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 
-    char line[1200];
+    char line[2048];
     std::snprintf(line, sizeof(line),
         "[MEM] stage=%s t_ms=%lld pid=%lld "
         "MemAvailableKiB=%lld MemFreeKiB=%lld CachedKiB=%lld ShmemKiB=%lld "
         "SReclaimableKiB=%lld SUnreclaimKiB=%lld SwapFreeKiB=%lld "
         "VmRSSKiB=%lld VmHWMKiB=%lld RssAnonKiB=%lld RssFileKiB=%lld "
         "RssShmemKiB=%lld VmSwapKiB=%lld PssKiB=%lld "
-        "dmaBufGlobalKiB=%lld dmaBufCount=%lld",
+        "dmaBufGlobalKiB=%lld dmaBufCount=%lld "
+        "MemTotalKiB=%lld RollupRssKiB=%lld PrivateCleanKiB=%lld "
+        "PrivateDirtyKiB=%lld SharedCleanKiB=%lld SharedDirtyKiB=%lld "
+        "SwapPssKiB=%lld IonTotalUsedKiB=%lld IonTotalCacheKiB=%lld",
         stage.c_str(), t_ms, (long long) getpid(),
         m.mem_available, m.mem_free, m.cached, m.shmem,
         m.sreclaimable, m.sunreclaim, m.swap_free,
         m.vm_rss, m.vm_hwm, m.rss_anon, m.rss_file,
-        m.rss_shmem, m.vm_swap, m.pss, m.dmabuf_kib, m.dmabuf_count);
+        m.rss_shmem, m.vm_swap, m.pss, m.dmabuf_kib, m.dmabuf_count,
+        m.mem_total, m.rollup_rss, m.private_clean, m.private_dirty,
+        m.shared_clean, m.shared_dirty, m.swap_pss,
+        m.ion_total_used, m.ion_total_cache);
     return line;
 }
 
