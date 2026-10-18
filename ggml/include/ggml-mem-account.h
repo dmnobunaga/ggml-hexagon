@@ -29,6 +29,11 @@ GGML_API void ggml_mem_account_mapping_change(const void * token, int delta);
 // that are not represented as persistent ggml_backend_buffer_t objects.
 GGML_API void ggml_mem_account_pool_high_water(const void * token, size_t bytes);
 
+// Additional categorization of regions allocated within an existing backing
+// for one graph. These are not new physical allocations.
+GGML_API void ggml_mem_account_pool_graph_regions(const void * token,
+        size_t persistent_mirror_new_bytes, size_t temporary_mirror_bytes, size_t descriptor_bytes);
+
 // Print an accounting snapshot. No-op unless GGML_MEM_ACCOUNTING=1.
 GGML_API void ggml_mem_account_snapshot(const char * stage);
 
