@@ -75,6 +75,7 @@
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-backend-impl.h"
 #include "ggml-mem-snapshot.h"
+#include "ggml-mem-account.h"
 #include "ggml-alloc.h"
 #include "ggml-common.h"
 #include "ggml-hexagon.h"
@@ -1926,6 +1927,7 @@ static int ggmlhexagon_init_rpcmempool(ggml_backend_hexagon_context * ctx) {
             ctx->rpc_mempool          = buf;
             ctx->rpc_mempool_capacity = targets[i] * SIZE_IN_MB;
             ctx->rpc_mempool_len      = pool_size * SIZE_IN_MB;
+            ggml_mem_account_pool_create(ctx->rpc_mempool, "HTP_RPCMEM", ctx->rpc_mempool_len);
             ggmlhexagon_mem_snapshot("after_rpcmem_alloc:HTP" + std::to_string(ctx->device));
             GGMLHEXAGON_LOG_ALWAYS("rpc mempool: %zu MiB allocated (target %zu MiB, device %d)",
                                     pool_size, targets[i], ctx->device);
@@ -1940,6 +1942,7 @@ mempool_acquired:
     ctx->rpc_mempool_handle = rpcmem_to_fd(ctx->rpc_mempool);
     if (ctx->rpc_mempool_handle < 0) {
         GGMLHEXAGON_LOG_ERROR("rpcmem_to_fd failed for %p", ctx->rpc_mempool);
+        ggml_mem_account_pool_destroy(ctx->rpc_mempool);
         rpcmem_free(ctx->rpc_mempool);
         ctx->rpc_mempool = nullptr;
         return 4;
@@ -1958,10 +1961,12 @@ mempool_acquired:
     if (mmap_err != 0) {
         GGMLHEXAGON_LOG_ERROR("fastrpc_mmap(%s) returned %d (fd=%d), aborting backend init",
                                mmap_mode_str, mmap_err, ctx->rpc_mempool_handle);
+        ggml_mem_account_pool_destroy(ctx->rpc_mempool);
         rpcmem_free(ctx->rpc_mempool);
         ctx->rpc_mempool = nullptr;
         return 5;
     }
+    ggml_mem_account_mapping_change(ctx->rpc_mempool, +1);
     GGMLHEXAGON_LOG_INFO("fastrpc_mmap(%s) OK: fd=%d, size=%zu MB",
                           mmap_mode_str, ctx->rpc_mempool_handle, ctx->rpc_mempool_len / SIZE_IN_MB);
 
@@ -1979,6 +1984,8 @@ mempool_acquired:
     if (reg_err != AEE_SUCCESS) {
         GGMLHEXAGON_LOG_ERROR("dsp_register_rpcmem failed: 0x%x, aborting backend init", reg_err);
         fastrpc_munmap(ctx->domain_id, ctx->rpc_mempool_handle, ctx->rpc_mempool, ctx->rpc_mempool_len);
+        ggml_mem_account_mapping_change(ctx->rpc_mempool, -1);
+        ggml_mem_account_pool_destroy(ctx->rpc_mempool);
         rpcmem_free(ctx->rpc_mempool);
         ctx->rpc_mempool = nullptr;
         return 6;
@@ -1998,8 +2005,11 @@ mempool_acquired:
 static void ggmlhexagon_deinit_rpcmempool(ggml_backend_hexagon_context * ctx) {
     if (ctx->rpc_mempool) {
         ggmlhexagon_mem_snapshot("before_rpcmem_free:HTP" + std::to_string(ctx->device));
+        ggml_mem_account_snapshot("before_rpcmem_free");
         GGMLHEXAGON_LOG_DEBUG("free rpc mempool %p", ctx->rpc_mempool);
         fastrpc_munmap(ctx->domain_id, ctx->rpc_mempool_handle, ctx->rpc_mempool, ctx->rpc_mempool_len);
+        ggml_mem_account_mapping_change(ctx->rpc_mempool, -1);
+        ggml_mem_account_pool_destroy(ctx->rpc_mempool);
         rpcmem_free(ctx->rpc_mempool);
         ctx->rpc_mempool            = nullptr;
         ctx->rpc_mempool_len        = 0;
@@ -7290,6 +7300,8 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
         ggmlhexagon_mem_snapshot("before_large_htp_alloc:" + alloc_stage);
     }
     GGMLHEXAGON_LOG_ALWAYS("[ALLOC] ENTER device=%d size=%zu bytes (%.2f MiB)", ctx->device, size, (double)size / (1024.0 * 1024.0));
+    // Both ordinary and REPACK buffers are views into the RPCMEM backing.
+    ggml_mem_account_external_buffer_type(buft);
     ggml_backend_hexagon_buffer_context * buffer_ctx = new ggml_backend_hexagon_buffer_context;
     buffer_ctx->backend_ctx = ctx;
     buffer_ctx->is_mempool_buffer = true;
@@ -7351,6 +7363,7 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
         if (r_offset + size_aligned > ctx->rpc_mempool_usage) {
             ctx->rpc_mempool_usage = r_offset + size_aligned;
         }
+        ggml_mem_account_pool_high_water(ctx->rpc_mempool, ctx->rpc_mempool_usage);
         GGMLHEXAGON_LOG_ALWAYS("[ALLOC] device=%d reuse free region: offset=%zu size=%zu (requested=%zu, waste=%zu)",
                              ctx->device, r_offset, ctx->ion_regions[best_idx].size, size_aligned,
                              ctx->ion_regions[best_idx].size - size_aligned);
@@ -7362,6 +7375,7 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
             buffer_ctx->buffer      = (char *)ctx->rpc_mempool + aligned_offset;
             buffer_ctx->buffer_size = size_aligned;
             ctx->rpc_mempool_usage  = aligned_offset + size_aligned;
+            ggml_mem_account_pool_high_water(ctx->rpc_mempool, ctx->rpc_mempool_usage);
             // Record new region
             ion_pool_region new_region;
             new_region.offset = aligned_offset;
@@ -7407,7 +7421,10 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
     if (large_alloc) {
         ggmlhexagon_mem_snapshot("after_large_htp_alloc:" + alloc_stage);
     }
-    return ggml_backend_buffer_init(buft, ggml_backend_hexagon_buffer_interface, buffer_ctx, size);
+    ggml_backend_buffer_t result = ggml_backend_buffer_init(buft, ggml_backend_hexagon_buffer_interface, buffer_ctx, size);
+    ggml_mem_account_buffer_attach(result, ctx->rpc_mempool,
+        (size_t)((char *)buffer_ctx->buffer - (char *)ctx->rpc_mempool), buffer_ctx->buffer_size);
+    return result;
 }
 
 static size_t ggml_backend_hexagon_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -8648,6 +8665,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         uint32_t moff = (uint32_t)aligned_offset;
         void * ion_buf = (char *)ctx->rpc_mempool + moff;
         ctx->rpc_mempool_usage = aligned_offset + mirror_size;
+        ggml_mem_account_pool_high_water(ctx->rpc_mempool, ctx->rpc_mempool_usage);
 
         // Record mirror region. Weight mirrors are persistent (survive across calls);
         // non-weight mirrors are temporary (freed after each call).
@@ -8870,6 +8888,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
 
     uint32_t batch_offset = (uint32_t)batch_offset_aligned;
     ctx->rpc_mempool_usage = batch_offset_aligned + total_desc_size;
+    ggml_mem_account_pool_high_water(ctx->rpc_mempool, ctx->rpc_mempool_usage);
     // Record batch descriptor as a temporary mempool region
     ion_pool_region batch_region;
     batch_region.offset = batch_offset_aligned;
