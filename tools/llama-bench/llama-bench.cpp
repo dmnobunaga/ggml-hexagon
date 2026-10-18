@@ -23,6 +23,7 @@
 #include <vector>
 #include <unordered_set>
 
+#include "battery-energy.h"
 #include "arg.h"
 #include "build-info.h"
 #include "common.h"
@@ -39,6 +40,8 @@
 #    endif
 #    include <windows.h>
 #endif
+
+static bool g_bench_energy = false;
 
 // utils
 static uint64_t get_time_ns() {
@@ -378,6 +381,7 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    bool                             energy;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -424,6 +428,7 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* energy               */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -444,6 +449,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --energy                                    measure device-wide Android battery energy per benchmark\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 0)\n");
     if (llama_supports_rpc()) {
@@ -542,6 +548,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.energy               = cmd_params_defaults.energy;
     params.offline              = cmd_params_defaults.offline;
 
     if (const char * env = getenv("HF_TOKEN")) {
@@ -588,6 +595,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.hf_token = argv[i];
+            } else if (arg == "--energy") {
+                params.energy = true;
             } else if (arg == "--offline") {
                 params.offline = true;
             } else if (arg == "-p" || arg == "--n-prompt") {
@@ -1514,6 +1523,10 @@ struct test {
     int                      n_depth;
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
+    double                   energy_mwh = -1.0;
+    double                   energy_w = -1.0;
+    double                   energy_mwh_per_1k_tokens = -1.0;
+    std::string              energy_source = "unavailable";
 
     test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) :
         cpu_info(get_cpu_info()),
@@ -1612,7 +1625,15 @@ struct test {
             "n_prompt",       "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
-        return fields;
+        if (!g_bench_energy) {
+            return fields;
+        }
+        static const std::vector<std::string> energy_fields = []() {
+            auto extra = fields;
+            extra.insert(extra.end(), { "energy_mwh", "energy_w", "energy_mwh_per_1k_tokens", "energy_source" });
+            return extra;
+        }();
+        return energy_fields;
     }
 
     enum field_type { STRING, BOOL, INT, FLOAT };
@@ -1629,7 +1650,8 @@ struct test {
             field == "embeddings" || field == "no_host" || field == "repack") {
             return BOOL;
         }
-        if (field == "avg_ts" || field == "stddev_ts") {
+        if (field == "avg_ts" || field == "stddev_ts" || field == "energy_mwh" ||
+            field == "energy_w" || field == "energy_mwh_per_1k_tokens") {
             return FLOAT;
         }
         if (field == "load_mode" || field == "lazy_mode") {
@@ -1717,6 +1739,12 @@ struct test {
                                             std::to_string(stdev_ns()),
                                             std::to_string(avg_ts()),
                                             std::to_string(stdev_ts()) };
+        if (g_bench_energy) {
+            values.push_back(energy_mwh >= 0.0 ? std::to_string(energy_mwh) : "");
+            values.push_back(energy_w >= 0.0 ? std::to_string(energy_w) : "");
+            values.push_back(energy_mwh_per_1k_tokens >= 0.0 ? std::to_string(energy_mwh_per_1k_tokens) : "");
+            values.push_back(energy_source);
+        }
         return values;
     }
 
@@ -1796,7 +1824,7 @@ static std::string format_json_value(const std::string & field, const std::strin
         case test::BOOL:
             return value == "0" ? "false" : "true";
         default:
-            return value;
+            return value.empty() ? "null" : value;
     }
 }
 
@@ -2047,6 +2075,11 @@ struct markdown_printer : public printer {
         }
         fields.emplace_back("test");
         fields.emplace_back("t/s");
+        if (params.energy) {
+            fields.emplace_back("energy_mwh");
+            fields.emplace_back("energy_w");
+            fields.emplace_back("energy_mwh_per_1k_tokens");
+        }
 
         fprintf(fout, "|");
         for (const auto & field : fields) {
@@ -2275,6 +2308,7 @@ int llama_bench(int argc, char ** argv) {
     ggml_backend_load_all();
 
     cmd_params params = parse_cmd_params(argc, argv);
+    g_bench_energy = params.energy;
 
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
