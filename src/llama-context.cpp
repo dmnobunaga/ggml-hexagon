@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-mem-snapshot.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -4018,6 +4019,13 @@ llama_context_params llama_context_default_params() {
     return result;
 }
 
+static void llama_context_mem_snapshot(const char * stage) {
+    const std::string snapshot = ggml_mem_snapshot(stage);
+    if (!snapshot.empty()) {
+        LLAMA_LOG_INFO("%s\n", snapshot.c_str());
+    }
+}
+
 llama_context * llama_init_from_model(
                  llama_model * model,
         llama_context_params   params) {
@@ -4108,7 +4116,9 @@ llama_context * llama_init_from_model(
     }
 
     try {
+        llama_context_mem_snapshot("before_context_init");
         auto * ctx = new llama_context(*model, params);
+        llama_context_mem_snapshot("after_context_init");
         const auto & cparams = ctx->get_cparams();
 
         if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {
