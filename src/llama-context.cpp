@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-mem-snapshot.h"
+#include "ggml-mem-account.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -574,6 +575,11 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    ggml_mem_account_snapshot("before_context_destroy");
+    const std::string mem_before_context_free = ggml_mem_snapshot("before_context_destroy");
+    if (!mem_before_context_free.empty()) {
+        LLAMA_LOG_INFO("%s\n", mem_before_context_free.c_str());
+    }
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -4119,6 +4125,7 @@ llama_context * llama_init_from_model(
         llama_context_mem_snapshot("before_context_init");
         auto * ctx = new llama_context(*model, params);
         llama_context_mem_snapshot("after_context_init");
+        ggml_mem_account_snapshot("context_ready");
         const auto & cparams = ctx->get_cparams();
 
         if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {
@@ -4144,6 +4151,8 @@ llama_context * llama_new_context_with_model(
 
 void llama_free(llama_context * ctx) {
     delete ctx;
+    ggml_mem_account_snapshot("after_context_destroy");
+    llama_context_mem_snapshot("after_context_destroy");
 }
 
 uint32_t llama_n_ctx(const llama_context * ctx) {
