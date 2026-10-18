@@ -2479,6 +2479,9 @@ int llama_bench(int argc, char ** argv) {
             }
         }
 
+        double energy_total_mwh = 0.0;
+        double energy_total_seconds = 0.0;
+        int energy_valid_reps = 0;
         for (int i = 0; i < params.reps; i++) {
             llama_memory_clear(llama_get_memory(ctx), false);
 
@@ -2519,6 +2522,8 @@ int llama_bench(int argc, char ** argv) {
                 }
             }
 
+            llama_bench_battery_meter energy_meter;
+            const bool energy_active = params.energy && energy_meter.start();
             uint64_t t_start = get_time_ns();
 
             if (t.n_prompt > 0) {
@@ -2550,6 +2555,23 @@ int llama_bench(int argc, char ** argv) {
 
             uint64_t t_ns = get_time_ns() - t_start;
             t.samples_ns.push_back(t_ns);
+            if (energy_active) {
+                const auto measured = energy_meter.finish();
+                if (measured.mwh >= 0.0) {
+                    energy_total_mwh += measured.mwh;
+                    energy_total_seconds += double(t_ns) / 1e9;
+                    energy_valid_reps++;
+                    t.energy_source = measured.source;
+                }
+            }
+        }
+        if (params.energy && energy_valid_reps > 0) {
+            t.energy_mwh = energy_total_mwh / energy_valid_reps;
+            t.energy_w = energy_total_seconds > 0.0 ? energy_total_mwh * 3.6 / energy_total_seconds : -1.0;
+            const int measured_tokens = energy_valid_reps * (t.n_prompt + t.n_gen);
+            t.energy_mwh_per_1k_tokens = measured_tokens > 0 ? energy_total_mwh * 1000.0 / measured_tokens : -1.0;
+        } else if (params.energy) {
+            fprintf(stderr, "llama-bench: warning: no usable Android battery energy counters (unplug charger and check sysfs permissions)\n");
         }
 
         if (p) {
