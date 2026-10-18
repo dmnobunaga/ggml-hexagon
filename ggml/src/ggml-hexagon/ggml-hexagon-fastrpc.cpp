@@ -36,6 +36,7 @@
 #include <future>
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 
 #ifdef __WIN32
     #    define WIN32_LEAN_AND_MEAN
@@ -1898,6 +1899,25 @@ static int ggmlhexagon_init_rpcmempool(ggml_backend_hexagon_context * ctx) {
     size_t * targets        = (htp_arch > 75) ? targets_79plus : targets_legacy;
     size_t   n_targets      = (htp_arch > 75) ? sizeof(targets_79plus) / sizeof(targets_79plus[0])
                                        : sizeof(targets_legacy) / sizeof(targets_legacy[0]);
+
+    size_t custom_target = 0;
+    const char * rpcmem_override = getenv("GGML_HEXAGON_RPCMEM_MB");
+    if (rpcmem_override && *rpcmem_override) {
+        char * end = nullptr;
+        errno = 0;
+        long requested = strtol(rpcmem_override, &end, 10);
+        if (errno != 0 || end == rpcmem_override || *end != '\0' ||
+            requested < 256 || requested > 4032 || requested % 64 != 0) {
+            GGMLHEXAGON_LOG_ERROR("invalid GGML_HEXAGON_RPCMEM_MB='%s': expected a multiple of 64 between 256 and 4032",
+                                  rpcmem_override);
+            return 3;
+        }
+        custom_target = (size_t) requested;
+        targets       = &custom_target;
+        n_targets     = 1;
+        GGMLHEXAGON_LOG_ALWAYS("rpc mempool override: target=%zu MiB, allocation=%zu MiB (8 MiB reserved)",
+                                custom_target, custom_target - 8);
+    }
     ggmlhexagon_mem_snapshot("before_rpcmem:HTP" + std::to_string(ctx->device));
     for (size_t i = 0; i < n_targets; i++) {
         size_t pool_size = targets[i] - 8;
@@ -7350,46 +7370,13 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
             ctx->ion_regions.push_back(new_region);
             GGMLHEXAGON_LOG_ALWAYS("[ALLOC] device=%d new region: offset=%zu size=%zu", ctx->device, aligned_offset, size_aligned);
         } else {
-            GGMLHEXAGON_LOG_ALWAYS("device=%d ion pool exhausted: needed %zu MiB, remaining %zu MiB -- falling back to CPU buffer",
-                                 ctx->device, size_aligned / SIZE_IN_MB,
-                                 (data_limit - ctx->rpc_mempool_usage) / SIZE_IN_MB);
-            // Do not keep a heap-backed hexagon buft buffer here: the scheduler
-            // would still assign ops to hexagon, but the per-token mempool mirror
-            // cannot fit (the pool is full), so compute would fail. Instead return
-            // a CPU (host) buffer so the scheduler routes these tensors' ops to the
-            // CPU backend, which reads the raw ggml layout directly. This mirrors
-            // the documented Q5_K weights -> CPU behavior.
-#if 0 //the OOM guard is too aggressive although it's correct
-            // OOM guard: an oversized CPU fallback (e.g. 8 GB BF16 weights) plus
-            // the 4 GB mempool can exhaust host RAM and trigger LMK / reboot.
-            // Reject the allocation so the caller falls back to CPU scheduling
-            // without doubling the model footprint.
-            {
-                size_t avail = 0;
-                FILE * f = fopen("/proc/meminfo", "r");
-                if (f) {
-                    char line[128];
-                    while (fgets(line, sizeof(line), f)) {
-                        if (strncmp(line, "MemAvailable:", 13) == 0) {
-                            avail = (size_t)atoll(line + 13) * 1024;  // kB -> bytes
-                            break;
-                        }
-                    }
-                    fclose(f);
-                }
-                if (avail > 0 && size_aligned > avail / 2) {
-                    GGMLHEXAGON_LOG_ERROR("device=%d CPU fallback %zu MiB would consume >50%% of available %zu MiB -- rejecting to avoid OOM",
-                                          ctx->device, size_aligned / SIZE_IN_MB, avail / SIZE_IN_MB);
-                    delete buffer_ctx;
-                    return nullptr;
-                }
-            }
-#endif
-            ggmlhexagon_mem_snapshot("before_cpu_fallback:" + alloc_stage);
+            GGMLHEXAGON_LOG_ERROR("device=%d HTP mempool exhausted: requested=%.2f MiB remaining=%.2f MiB capacity=%.2f MiB; refusing CPU fallback",
+                                  ctx->device, (double) size_aligned / SIZE_IN_MB,
+                                  (double) (data_limit - ctx->rpc_mempool_usage) / SIZE_IN_MB,
+                                  (double) data_limit / SIZE_IN_MB);
+            ggmlhexagon_mem_snapshot("reject_htp_pool_exhausted:" + alloc_stage);
             delete buffer_ctx;
-            ggml_backend_buffer_t host_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size_aligned);
-            ggmlhexagon_mem_snapshot("after_cpu_fallback:" + alloc_stage);
-            return host_buffer;
+            return nullptr;
         }
     }
 
