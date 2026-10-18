@@ -23,6 +23,7 @@
 #include "models/models.h"
 
 #include "ggml.h"
+#include "ggml-mem-snapshot.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -1575,6 +1576,13 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+static void llama_model_mem_snapshot(const std::string & stage) {
+    const std::string snapshot = ggml_mem_snapshot(stage);
+    if (!snapshot.empty()) {
+        LLAMA_LOG_INFO("%s\n", snapshot.c_str());
+    }
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -1899,6 +1907,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     //     across disjoint ranges of a file (see get_mapping_ranges)
     pimpl->ctxs_bufs.reserve(ml.ctx_map.size() * ml.files.size());
 
+    llama_model_mem_snapshot("before_model_buffers");
     for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
         ggml_backend_buffer_type_t buft = ctx_key.buft;
         ggml_context * ctx = ctx_ptr.get();
@@ -1985,7 +1994,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
 
         ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
+        llama_model_mem_snapshot(std::string("after_model_buffer:") + ggml_backend_buft_name(buft));
     }
+    llama_model_mem_snapshot("after_model_buffers");
 
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, n_layer_all);
@@ -2024,11 +2035,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
+    llama_model_mem_snapshot("before_load_all_data");
     for (auto & [ctx, bufs] : ctx_bufs) {
+        const std::string group = bufs.empty() ? "unknown" : ggml_backend_buffer_name(bufs[0]);
+        llama_model_mem_snapshot("before_load_all_data:" + group);
         if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+            llama_model_mem_snapshot("failed_load_all_data:" + group);
             return false;
         }
+        llama_model_mem_snapshot("after_load_all_data:" + group);
     }
+    llama_model_mem_snapshot("after_load_all_data");
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
@@ -2037,6 +2054,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+    llama_model_mem_snapshot("after_model_finalize");
 
     return true;
 }
