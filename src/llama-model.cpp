@@ -28,6 +28,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
+#include <cstdlib>
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
@@ -1906,6 +1908,99 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // reserve hint: each context creates one buffer per file, or more when its tensors are spread
     //     across disjoint ranges of a file (see get_mapping_ranges)
     pimpl->ctxs_bufs.reserve(ml.ctx_map.size() * ml.files.size());
+
+#if defined(__ANDROID__)
+    if (!ml.no_alloc) {
+        const size_t MiB = 1024 * 1024;
+        size_t planned_cpu = 0;
+        std::map<ggml_backend_dev_t, std::pair<size_t, size_t>> planned_htp;
+
+        for (auto & [key, ctx_ptr] : ml.ctx_map) {
+            ggml_context * ctx = ctx_ptr.get();
+            if (!ggml_get_first_tensor(ctx)) {
+                continue;
+            }
+
+            ggml_backend_buffer_type_t buft = key.buft;
+            const char * buft_name = ggml_backend_buft_name(buft);
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            const size_t bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
+            const bool is_htp = buft_name && std::strstr(buft_name, "hexagon-ion-buffer") != nullptr;
+            const bool is_cpu = !dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+                                (buft_name && std::strncmp(buft_name, "CPU", 3) == 0);
+
+            if (is_htp) {
+                if (!dev) {
+                    throw std::runtime_error("HTP memory preflight failed: backend device is unavailable");
+                }
+                auto & plan = planned_htp[dev];
+                if (bytes > SIZE_MAX - plan.first) {
+                    throw std::runtime_error("HTP memory preflight failed: size overflow");
+                }
+                plan.first += bytes;
+                plan.second = ggml_backend_buft_get_max_size(buft);
+            } else if (is_cpu) {
+                if (bytes > SIZE_MAX - planned_cpu) {
+                    throw std::runtime_error("CPU memory preflight failed: size overflow");
+                }
+                planned_cpu += bytes;
+            }
+        }
+
+        if (!planned_htp.empty()) {
+            for (const auto & [dev, plan] : planned_htp) {
+                const size_t htp_reserve = 128 * MiB;
+                const size_t needed = plan.first;
+                const size_t capacity = plan.second;
+                LLAMA_LOG_INFO("[MEM-GUARD] HTP=%s planned=%.2f MiB pool=%.2f MiB compute_reserve=128 MiB\n",
+                    ggml_backend_dev_name(dev), (double) needed / MiB, (double) capacity / MiB);
+                if (needed > capacity || capacity - needed < htp_reserve) {
+                    throw std::runtime_error(format(
+                        "[MEM-GUARD] HTP pool too small: planned=%.2f MiB reserve=128 MiB pool=%.2f MiB",
+                        (double) needed / MiB, (double) capacity / MiB));
+                }
+            }
+
+            size_t reserve_mb = 1536;
+            if (const char * env = std::getenv("GGML_HEXAGON_MEMORY_RESERVE_MB")) {
+                char * end = nullptr;
+                errno = 0;
+                long parsed = std::strtol(env, &end, 10);
+                if (errno != 0 || end == env || *end != '\0' || parsed < 0 || parsed > 8192) {
+                    throw std::runtime_error("invalid GGML_HEXAGON_MEMORY_RESERVE_MB: expected integer 0..8192");
+                }
+                reserve_mb = (size_t) parsed;
+            }
+
+            long long available_kib = -1;
+            FILE * meminfo = std::fopen("/proc/meminfo", "r");
+            if (meminfo) {
+                char line[256];
+                while (std::fgets(line, sizeof(line), meminfo)) {
+                    if (std::sscanf(line, "MemAvailable: %lld", &available_kib) == 1) {
+                        break;
+                    }
+                }
+                std::fclose(meminfo);
+            }
+
+            if (available_kib < 0) {
+                throw std::runtime_error("[MEM-GUARD] unable to read MemAvailable from /proc/meminfo");
+            }
+
+            const size_t available_mb = (size_t) available_kib / 1024;
+            const size_t planned_cpu_mb = planned_cpu / MiB + (planned_cpu % MiB != 0);
+            LLAMA_LOG_INFO("[MEM-GUARD] MemAvailable=%zu MiB planned_cpu=%zu MiB reserve=%zu MiB required=%zu MiB\n",
+                available_mb, planned_cpu_mb, reserve_mb, planned_cpu_mb + reserve_mb);
+            if (planned_cpu_mb > available_mb || reserve_mb > available_mb - planned_cpu_mb) {
+                throw std::runtime_error(format(
+                    "[MEM-GUARD] insufficient RAM: available=%zu MiB planned_cpu=%zu MiB reserve=%zu MiB",
+                    available_mb, planned_cpu_mb, reserve_mb));
+            }
+            LLAMA_LOG_INFO("[MEM-GUARD] PASS: memory budget accepted before weight allocations\n");
+        }
+    }
+#endif
 
     llama_model_mem_snapshot("before_model_buffers");
     for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
