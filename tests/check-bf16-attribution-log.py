@@ -18,7 +18,7 @@ ACCOUNT_RX = re.compile(r"\[MEM-ACCOUNT-BUFT\] stage=(\S+) type=(\S+) buft_id=(\
 MEASURES = ("MemAvailableKiB", "VmRSSKiB", "PssKiB", "IonTotalUsedKiB",
             "IonTotalCacheKiB", "RssAnonKiB", "VmSwapKiB", "dmaBufGlobalKiB")
 PHASES = ("before_rpcmem", "after_rpcmem_alloc", "after_rpcmem_register",
-          "memory_preflight_before_guard", "memory_guard_reject_cpu",
+          "memory_preflight_before_guard", "memory_preflight_only", "memory_guard_reject_cpu",
           "before_model_buffers", "after_load_all_data", "after_context_init",
           "before_rpcmem_free", "after_rpcmem_free")
 
