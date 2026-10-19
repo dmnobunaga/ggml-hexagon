@@ -54,10 +54,14 @@ adb shell 'cd /data/local/tmp &&
 adb pull /data/local/tmp/q4-attribution.log .
 ```
 
-Then run BF16 with the **unchanged** safety reserve (2048 MiB). This is
-intentionally a guarded preflight: with the previously observed RAM
-conditions it is expected to **reject before model-weight allocations**.
-No BF16 tensors are loaded if the guard rejects.
+Then run BF16 with the **unchanged** safety reserve (2048 MiB) and the
+new opt-in **`GGML_MEM_PREFLIGHT_ONLY=1`** switch. With previously observed RAM
+conditions the guard is expected to **reject before model-weight allocations**.
+If the guard unexpectedly PASSES (because the system is less loaded), the
+preflight-only switch still stops the load *before any model-weight buffer*
+is allocated. The command returns a nonzero exit code **by design**:
+`[MEM-PLAN] PREFLIGHT_ONLY` is a successful diagnostic stopping point,
+not an inference success.
 
 ```sh
 adb shell 'cd /data/local/tmp &&
@@ -65,6 +69,7 @@ adb shell 'cd /data/local/tmp &&
   export GGML_HEXAGON_DEVICES=1 &&
   export GGML_HEXAGON_RPCMEM_MB=3712 &&
   export GGML_HEXAGON_MEMORY_RESERVE_MB=2048 &&
+  export GGML_MEM_PREFLIGHT_ONLY=1 &&
   export GGML_MEM_ACCOUNTING=1 &&
   export GGML_MEM_SNAPSHOT=1 &&
   ./llama-bench -v -t 8 -ngl 15 -fa 1 -p 32 -n 8 -r 1 \
@@ -85,8 +90,10 @@ python3 tests/check-bf16-attribution-log.py bf16-preflight.log
 python3 tests/check-mem-account-log.py q4-attribution.log
 ```
 
-The BF16 log may not contain any `model_buffers_allocated` or
-`model_weights_loaded` accounting — that is expected on guarded rejection.
+The BF16 log contains no `model_buffers_allocated` or `model_weights_loaded`
+accounting because the guard rejects or `GGML_MEM_PREFLIGHT_ONLY=1`
+deliberately short-circuits before model-weight allocation. This is
+expected and does not prove BF16 could complete a full load.
 
 ## Interpretation and falsifiable questions
 
@@ -113,9 +120,11 @@ source-to-destination identity trace. This phase does NOT make that claim.
 
 **What is BF16's real failure point?**
 If `memory_guard_reject_cpu` occurs, model-weight allocation did not
-execute. We have learned the planned host storage and how much RAM/ION
-existed *after* creating the HTP backing, but **not** whether allocating
-all BF16 host weights would in fact succeed. There is no need to risk an
+execute. If the guard passes but `memory_preflight_only` occurs, the
+allocation was also deliberately skipped. In either case we have learned
+the planned host storage and how much RAM/ION existed *after* creating
+the HTP backing, but **not** whether allocating all BF16 host weights
+would in fact succeed. There is no need to risk an
 LMK to distinguish this.
 
 **How much of the pool is actually used?**
