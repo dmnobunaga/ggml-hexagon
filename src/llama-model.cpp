@@ -2015,6 +2015,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     available_mb, planned_cpu_mb, reserve_mb));
             }
             LLAMA_LOG_INFO("[MEM-GUARD] PASS: memory budget accepted before weight allocations\n");
+            // Opt-in, read-only diagnostic: do not allocate model weights,
+            // even when current available memory would otherwise pass.
+            // This avoids an accidental BF16 OOM during profiling.
+            const char * preflight_only = std::getenv("GGML_MEM_PREFLIGHT_ONLY");
+            if (preflight_only && std::strcmp(preflight_only, "1") == 0) {
+                LLAMA_LOG_INFO("[MEM-PLAN] PREFLIGHT_ONLY: diagnostics complete; intentionally stopping before weight allocations\n");
+                llama_model_mem_snapshot("memory_preflight_only");
+                ggml_mem_account_snapshot("memory_preflight_only");
+                return false;
+            }
         }
     }
 #endif
