@@ -71,6 +71,8 @@ struct mem_account_buffer {
     uint64_t buffer_type_id = 0;
     uint64_t started_us = 0;
     std::string type;
+    std::string requested_type;
+    uint64_t requested_buft_id = 0;
     size_t bytes = 0;
     size_t offset = 0;
     size_t writes = 0;
@@ -144,6 +146,7 @@ static void mem_account_buffer_created(const void * token, const void * buft,
     b.id = s.next_id++;
     b.started_us = mem_account_now_us();
     b.type = type ? type : "unknown";
+    b.requested_type = b.type;
     auto bt = s.buffer_types.find(buft);
     if (bt == s.buffer_types.end()) {
         b.buffer_type_id = s.next_id++;
@@ -151,6 +154,7 @@ static void mem_account_buffer_created(const void * token, const void * buft,
     } else {
         b.buffer_type_id = bt->second;
     }
+    b.requested_buft_id = b.buffer_type_id;
     b.bytes = bytes;
     b.external = s.external_types.count(buft) != 0;
     b.physical_owner = owns_storage && !b.external;
@@ -167,6 +171,23 @@ static void mem_account_buffer_created(const void * token, const void * buft,
             (unsigned long long)b.id, (unsigned long long)b.backing_id,
             b.type.c_str(), bytes, (int)b.physical_owner, (int)b.external);
     }
+}
+
+// Store provenance of the allocator request. REPACK implementations may
+// delegate to a plain CPU allocator and return a CPU-labeled backing buffer.
+static void mem_account_buffer_requested(const void * token, const void * requested_buft, const char * requested_name) {
+    if (!mem_account_enabled() || !token) return;
+    auto & s = mem_account_get_state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    auto it = s.buffers.find(token);
+    if (it == s.buffers.end()) return;
+    it->second.requested_type = requested_name ? requested_name : "unknown";
+    auto bt = s.buffer_types.find(requested_buft);
+    if (bt == s.buffer_types.end()) {
+        uint64_t id = s.next_id++;
+        bt = s.buffer_types.emplace(requested_buft, id).first;
+    }
+    it->second.requested_buft_id = bt->second;
 }
 
 static void mem_account_buffer_freed(const void * token) {
@@ -357,10 +378,11 @@ void ggml_mem_account_snapshot(const char * stage) {
         s.buffers.size(), (unsigned long long)s.alloc_count, (unsigned long long)s.free_count,
         (double)s.write_bytes/(1024*1024), (unsigned long long)s.write_calls);
     struct usage_row { size_t buffers=0, bytes=0, physical=0, weights=0; };
-    std::map<std::pair<std::string, uint64_t>, usage_row> by_type;
+    using mem_account_type_key = std::tuple<std::string, uint64_t, std::string, uint64_t>;
+    std::map<mem_account_type_key, usage_row> by_type;
     for (const auto & kv : s.buffers) {
         const auto & b = kv.second;
-        auto & row = by_type[{b.type, b.buffer_type_id}];
+        auto & row = by_type[{b.requested_type, b.requested_buft_id, b.type, b.buffer_type_id}];
         row.buffers++;
         row.bytes += b.bytes;
         if (b.physical_owner) row.physical += b.bytes;
@@ -369,8 +391,9 @@ void ggml_mem_account_snapshot(const char * stage) {
     for (const auto & kv : by_type) {
         const auto & v = kv.second;
         std::fprintf(stderr,
-            "[MEM-ACCOUNT-BUFT] stage=%s type=%s buft_id=%llu buffers=%zu logical=%.2fMiB physical_unique=%.2fMiB marked_weights=%.2fMiB\n",
-            label, kv.first.first.c_str(), (unsigned long long)kv.first.second,
+            "[MEM-ACCOUNT-BUFT] stage=%s type=%s buft_id=%llu actual_type=%s actual_buft_id=%llu buffers=%zu logical=%.2fMiB physical_unique=%.2fMiB marked_weights=%.2fMiB\n",
+            label, std::get<0>(kv.first).c_str(), (unsigned long long)std::get<1>(kv.first),
+            std::get<2>(kv.first).c_str(), (unsigned long long)std::get<3>(kv.first),
             v.buffers, (double)v.bytes/(1024*1024),
             (double)v.physical/(1024*1024), (double)v.weights/(1024*1024));
     }
@@ -402,7 +425,10 @@ ggml_backend_buffer_t ggml_backend_buft_alloc_buffer(ggml_backend_buffer_type_t 
         // return a dummy buffer for zero-sized allocations
         return ggml_backend_buffer_init(buft, {}, NULL, 0);
     }
-    return buft->iface.alloc_buffer(buft, size);
+    ggml_backend_buffer_t buffer = buft->iface.alloc_buffer(buft, size);
+    // Distinguish request provenance from returned backing implementation.
+    mem_account_buffer_requested(buffer, buft, ggml_backend_buft_name(buft));
+    return buffer;
 }
 
 // shared planning logic for allocating a list of tensors into one or more buffers of the given type
