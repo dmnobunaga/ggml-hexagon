@@ -48,6 +48,7 @@
 #else
     #include <unistd.h>
     #include <sys/sysinfo.h>
+    #include <sys/stat.h>
 #endif
 
 #if defined(__ANDROID__)
@@ -622,8 +623,49 @@ void ggmlhexagon_log_always_internal(int level, const char * file, const char * 
 static void ggmlhexagon_mem_snapshot(const std::string & stage) {
     const std::string snapshot = ggml_mem_snapshot(stage);
     if (!snapshot.empty()) {
-        GGMLHEXAGON_LOG_ALWAYS("%s", snapshot.c_str());
+        // On Android GGMLHEXAGON_LOG_ALWAYS may go only to logcat. Mirror the
+        // optional memory sample to stderr so adb shell redirection captures
+        // RPCMEM lifetime, including before the first model buffer is created.
+        fprintf(stderr, "%s\n", snapshot.c_str());
+        fflush(stderr);
     }
+}
+
+static void ggmlhexagon_rpcmem_fd_snapshot(const ggml_backend_hexagon_context * ctx, const char * stage) {
+#if defined(__linux__) || defined(__ANDROID__)
+    const char * enabled = getenv("GGML_MEM_SNAPSHOT");
+    if (!enabled || strcmp(enabled, "1") != 0 || !ctx || ctx->rpc_mempool_handle < 0) return;
+    struct stat sb = {};
+    const bool stat_ok = fstat(ctx->rpc_mempool_handle, &sb) == 0;
+    char path[80];
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", ctx->rpc_mempool_handle);
+    char link_target[192] = {};
+    const ssize_t length = readlink(path, link_target, sizeof(link_target) - 1);
+    if (length >= 0) link_target[length] = 0;
+    char sysfs_path[128];
+    FILE * size_file = nullptr;
+    long long sysfs_size = -1;
+    if (stat_ok) {
+        snprintf(sysfs_path, sizeof(sysfs_path), "/sys/kernel/dmabuf/buffers/%llu/size",
+                 (unsigned long long)sb.st_ino);
+        size_file = fopen(sysfs_path, "r");
+        if (size_file) {
+            if (fscanf(size_file, "%lld", &sysfs_size) != 1) sysfs_size = -1;
+            fclose(size_file);
+        }
+    }
+    fprintf(stderr,
+            "[MEM-RPCMEM-FD] stage=%s device=%d fd=%d backing_bytes=%zu "
+            "stat_ok=%d inode=%llu stat_size=%lld sysfs_dmabuf_size=%lld link=%s\n",
+            stage, ctx->device, ctx->rpc_mempool_handle, ctx->rpc_mempool_len,
+            (int)stat_ok, stat_ok ? (unsigned long long)sb.st_ino : 0ULL,
+            stat_ok ? (long long)sb.st_size : -1LL, sysfs_size,
+            length >= 0 ? link_target : "unavailable");
+    fflush(stderr);
+#else
+    (void)ctx;
+    (void)stage;
+#endif
 }
 
 // Invoke one no-op warmup call and record FastRPC transport overhead timing.
@@ -1947,6 +1989,7 @@ mempool_acquired:
         ctx->rpc_mempool = nullptr;
         return 4;
     }
+    ggmlhexagon_rpcmem_fd_snapshot(ctx, "after_rpcmem_to_fd");
     GGMLHEXAGON_LOG_INFO("rpc mempool handle %d",       ctx->rpc_mempool_handle);
     GGMLHEXAGON_LOG_INFO("rpc mempool addr %p",         ctx->rpc_mempool);
     GGMLHEXAGON_LOG_INFO("rpc mempool size %zu (%zu MB)", ctx->rpc_mempool_len, ctx->rpc_mempool_len / SIZE_IN_MB);
@@ -1993,6 +2036,7 @@ mempool_acquired:
     GGMLHEXAGON_LOG_ALWAYS("registered mempool base via scalar call: fd=%d, size=%zu MB, time=%lld us",
                             ctx->rpc_mempool_handle, ctx->rpc_mempool_len / SIZE_IN_MB, (long long)dt_reg);
     GGMLHEXAGON_LOG_ALWAYS("mempool layout: total=%zuMB", ctx->rpc_mempool_len / SIZE_IN_MB);
+    ggmlhexagon_rpcmem_fd_snapshot(ctx, "after_rpcmem_register");
     ggmlhexagon_mem_snapshot("after_rpcmem_register:HTP" + std::to_string(ctx->device));
     // Prime the RPC overhead profiler with a few no-op warmup calls to get
     // a meaningful min/max/avg distribution without polluting the pool.
@@ -2004,6 +2048,7 @@ mempool_acquired:
 
 static void ggmlhexagon_deinit_rpcmempool(ggml_backend_hexagon_context * ctx) {
     if (ctx->rpc_mempool) {
+        ggmlhexagon_rpcmem_fd_snapshot(ctx, "before_rpcmem_free");
         ggmlhexagon_mem_snapshot("before_rpcmem_free:HTP" + std::to_string(ctx->device));
         ggml_mem_account_snapshot("before_rpcmem_free");
         GGMLHEXAGON_LOG_DEBUG("free rpc mempool %p", ctx->rpc_mempool);
