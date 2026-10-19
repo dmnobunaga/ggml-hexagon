@@ -1914,6 +1914,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (!ml.no_alloc) {
         const size_t MiB = 1024 * 1024;
         size_t planned_cpu = 0;
+        size_t planned_htp_bytes = 0;
+        const char * segmented_env = std::getenv("GGML_HEXAGON_SEGMENTED_RPCMEM");
+        const bool segmented_rpcmem = segmented_env && std::strcmp(segmented_env, "1") == 0;
         std::map<ggml_backend_dev_t, std::pair<size_t, size_t>> planned_htp;
 
         for (auto & [key, ctx_ptr] : ml.ctx_map) {
@@ -1926,7 +1929,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             const char * buft_name = ggml_backend_buft_name(buft);
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
             const size_t bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
-            const bool is_htp = buft_name && std::strstr(buft_name, "hexagon-ion-buffer") != nullptr;
+            const char * dev_name = dev ? ggml_backend_dev_name(dev) : nullptr;
+            const bool is_htp = (buft_name && std::strstr(buft_name, "hexagon-ion-buffer") != nullptr) ||
+                                (dev_name && std::strncmp(dev_name, "HTP", 3) == 0);
             const bool is_cpu = !dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ||
                                 (buft_name && std::strncmp(buft_name, "CPU", 3) == 0);
             // Requested storage is described by GGML buffer types; never by
@@ -1949,6 +1954,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     throw std::runtime_error("HTP memory preflight failed: size overflow");
                 }
                 plan.first += bytes;
+                if (bytes > SIZE_MAX - planned_htp_bytes) throw std::runtime_error("HTP size overflow");
+                planned_htp_bytes += bytes;
                 plan.second = ggml_backend_buft_get_max_size(buft);
             } else if (is_cpu) {
                 if (bytes > SIZE_MAX - planned_cpu) {
@@ -1967,7 +1974,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 const size_t capacity = plan.second;
                 LLAMA_LOG_INFO("[MEM-GUARD] HTP=%s planned=%.2f MiB pool=%.2f MiB compute_reserve=128 MiB\n",
                     ggml_backend_dev_name(dev), (double) needed / MiB, (double) capacity / MiB);
-                if (needed > capacity || capacity - needed < htp_reserve) {
+                if (!segmented_rpcmem && (needed > capacity || capacity - needed < htp_reserve)) {
                     llama_model_mem_snapshot("memory_guard_reject_htp");
                     ggml_mem_account_snapshot("memory_guard_reject_htp");
                     throw std::runtime_error(format(
@@ -2005,9 +2012,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
             const size_t available_mb = (size_t) available_kib / 1024;
             const size_t planned_cpu_mb = planned_cpu / MiB + (planned_cpu % MiB != 0);
-            LLAMA_LOG_INFO("[MEM-GUARD] MemAvailable=%zu MiB planned_cpu=%zu MiB reserve=%zu MiB required=%zu MiB\n",
-                available_mb, planned_cpu_mb, reserve_mb, planned_cpu_mb + reserve_mb);
-            if (planned_cpu_mb > available_mb || reserve_mb > available_mb - planned_cpu_mb) {
+            const size_t planned_htp_mb = segmented_rpcmem
+                    ? planned_htp_bytes / MiB + (planned_htp_bytes % MiB != 0) : 0;
+            const size_t required_mb = planned_cpu_mb + planned_htp_mb + reserve_mb;
+            LLAMA_LOG_INFO("[MEM-GUARD] MemAvailable=%zu MiB planned_cpu=%zu MiB planned_htp=%zu MiB reserve=%zu MiB required=%zu MiB segmented=%d\n",
+                available_mb, planned_cpu_mb, planned_htp_mb, reserve_mb, required_mb, (int)segmented_rpcmem);
+            if (required_mb > available_mb) {
                 llama_model_mem_snapshot("memory_guard_reject_cpu");
                 ggml_mem_account_snapshot("memory_guard_reject_cpu");
                 throw std::runtime_error(format(
