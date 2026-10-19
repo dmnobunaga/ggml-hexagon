@@ -1956,7 +1956,7 @@ static int ggmlhexagon_init_rpcmempool(ggml_backend_hexagon_context * ctx) {
 
     size_t custom_target = 0;
     const char * rpcmem_override = getenv("GGML_HEXAGON_RPCMEM_MB");
-    if (rpcmem_override && *rpcmem_override) {
+    if (!ctx->segmented_rpcmem && rpcmem_override && *rpcmem_override) {
         char * end = nullptr;
         errno = 0;
         long requested = strtol(rpcmem_override, &end, 10);
@@ -2097,6 +2097,14 @@ static bool ggmlhexagon_is_mapped_ptr(const ggml_backend_hexagon_context * ctx, 
 }
 
 static void ggmlhexagon_deinit_rpcmempool(ggml_backend_hexagon_context * ctx) {
+    for (const auto & kv : ctx->rpc_segments) {
+        const auto & seg = kv.second;
+        fastrpc_munmap(ctx->domain_id, seg.fd, seg.base, seg.size);
+        ggml_mem_account_mapping_change(seg.base, -1);
+        ggml_mem_account_pool_destroy(seg.base);
+        rpcmem_free(seg.base);
+    }
+    ctx->rpc_segments.clear();
     if (ctx->rpc_mempool) {
         ggmlhexagon_rpcmem_fd_snapshot(ctx, "before_rpcmem_free");
         ggmlhexagon_mem_snapshot("before_rpcmem_free:HTP" + std::to_string(ctx->device));
@@ -7415,11 +7423,11 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
     buffer_ctx->is_mempool_buffer = true;
 
     if (ctx->segmented_rpcmem) {
-        if (size == 0 || size > 1024ull * SIZE_IN_MB) {
+        if (size > 1024ull * SIZE_IN_MB) {
             delete buffer_ctx;
             return nullptr;
         }
-        size_t map_size = ((size + 4095) & ~(size_t)4095) + 4096;
+        size_t map_size = ((std::max<size_t>(size, 1) + 4095) & ~(size_t)4095) + 4096;
         if (ctx->has_extended_map && g_hexagon_appcfg.rpc_mmap_mode == 0) {
             const size_t align = 2ull * SIZE_IN_MB;
             map_size = (map_size + align - 1) & ~(align - 1);
