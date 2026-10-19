@@ -1917,6 +1917,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         size_t planned_htp_bytes = 0;
         const char * segmented_env = std::getenv("GGML_HEXAGON_SEGMENTED_RPCMEM");
         const bool segmented_rpcmem = segmented_env && std::strcmp(segmented_env, "1") == 0;
+        const char * warn_only_env = std::getenv("GGML_MEM_GUARD_WARN_ONLY");
+        const bool guard_warn_only = segmented_rpcmem && warn_only_env && std::strcmp(warn_only_env, "1") == 0;
         std::map<ggml_backend_dev_t, std::pair<size_t, size_t>> planned_htp;
         bool is_fastrpc_backend = false;
 
@@ -2023,13 +2025,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_INFO("[MEM-GUARD] MemAvailable=%zu MiB planned_cpu=%zu MiB planned_htp=%zu MiB reserve=%zu MiB required=%zu MiB segmented=%d\n",
                 available_mb, planned_cpu_mb, planned_htp_mb, reserve_mb, required_mb, (int)segmented_rpcmem);
             if (required_mb > available_mb) {
-                llama_model_mem_snapshot("memory_guard_reject_cpu");
-                ggml_mem_account_snapshot("memory_guard_reject_cpu");
-                throw std::runtime_error(format(
-                    "[MEM-GUARD] insufficient RAM: available=%zu MiB planned_cpu=%zu MiB reserve=%zu MiB",
-                    available_mb, planned_cpu_mb, reserve_mb));
+                if (guard_warn_only) {
+                    LLAMA_LOG_WARN("[MEM-GUARD] WARN-ONLY: required=%zu MiB available=%zu MiB deficit=%zu MiB; continuing into allocations\n",
+                        required_mb, available_mb, required_mb - available_mb);
+                    llama_model_mem_snapshot("memory_guard_warn_only");
+                    ggml_mem_account_snapshot("memory_guard_warn_only");
+                } else {
+                    llama_model_mem_snapshot("memory_guard_reject_cpu");
+                    ggml_mem_account_snapshot("memory_guard_reject_cpu");
+                    throw std::runtime_error(format(
+                        "[MEM-GUARD] insufficient RAM: available=%zu MiB planned_cpu=%zu MiB planned_htp=%zu MiB reserve=%zu MiB required=%zu MiB",
+                        available_mb, planned_cpu_mb, planned_htp_mb, reserve_mb, required_mb));
+                }
+            } else {
+                LLAMA_LOG_INFO("[MEM-GUARD] PASS: memory budget accepted before weight allocations\n");
             }
-            LLAMA_LOG_INFO("[MEM-GUARD] PASS: memory budget accepted before weight allocations\n");
             // Opt-in, read-only diagnostic: do not allocate model weights,
             // even when current available memory would otherwise pass.
             // This avoids an accidental BF16 OOM during profiling.
