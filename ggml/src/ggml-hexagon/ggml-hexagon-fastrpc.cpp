@@ -148,6 +148,12 @@ struct qcom_socinfo {
 // - batch temporaries (mirrors, batch descriptors): pushed per
 //   graph_compute_batch call, erased on cleanup when the bump pointer
 //   is rolled back.
+struct ggmlhexagon_rpc_segment {
+    void * base = nullptr;
+    size_t size = 0;
+    int fd = -1;
+};
+
 struct ion_pool_region {
     size_t offset;      // byte offset from mempool base
     size_t size;        // allocation size in bytes
@@ -189,6 +195,8 @@ struct ggml_backend_hexagon_context {
     void * rpc_mempool_dsp_base;                // NPU-side VA from fastrpc_mmap
     bool   dsp_need_weight_inval_reset;         // set by free_buffer on model unload, sent to NPU via 0xFFFC before next batch
     std::vector<ion_pool_region> ion_regions;   // region tracking for mempool free-space management
+    bool segmented_rpcmem = false;
+    std::map<uint32_t, ggmlhexagon_rpc_segment> rpc_segments;
 
     // FastRPC call statistics
     uint64_t rpc_batch_call_count;              // total ggml_htp_execute_batch calls
@@ -1930,6 +1938,9 @@ static int ggmlhexagon_init_rpcmempool(ggml_backend_hexagon_context * ctx) {
         return 1;
     }
 
+    const char * segmented_env = getenv("GGML_HEXAGON_SEGMENTED_RPCMEM");
+    ctx->segmented_rpcmem = segmented_env && strcmp(segmented_env, "1") == 0;
+
     int htp_arch = 0;
     htp_arch = ggmlhexagon_probe_dspinfo(ctx);
     if (0 == htp_arch) {
@@ -1960,6 +1971,22 @@ static int ggmlhexagon_init_rpcmempool(ggml_backend_hexagon_context * ctx) {
         n_targets     = 1;
         GGMLHEXAGON_LOG_ALWAYS("rpc mempool override: target=%zu MiB, allocation=%zu MiB (8 MiB reserved)",
                                 custom_target, custom_target - 8);
+    }
+    if (ctx->segmented_rpcmem) {
+        size_t workspace_mb = 256;
+        if (const char * env = getenv("GGML_HEXAGON_WORKSPACE_MB")) {
+            char * end = nullptr;
+            long val = strtol(env, &end, 10);
+            if (end == env || *end != '\0' || val < 64 || val > 1024) {
+                GGMLHEXAGON_LOG_ERROR("GGML_HEXAGON_WORKSPACE_MB expects 64..1024");
+                return 3;
+            }
+            workspace_mb = (size_t)val;
+        }
+        custom_target = workspace_mb + 8;
+        targets = &custom_target;
+        n_targets = 1;
+        GGMLHEXAGON_LOG_ALWAYS("[RPC-SEG] segmented RPCMEM enabled; workspace=%zu MiB", workspace_mb);
     }
     ggmlhexagon_mem_snapshot("before_rpcmem:HTP" + std::to_string(ctx->device));
     for (size_t i = 0; i < n_targets; i++) {
@@ -2044,6 +2071,29 @@ mempool_acquired:
         (void)hexagon_warmup_invoke_timed(ctx);
     }
     return 0;
+}
+
+static bool ggmlhexagon_segment_lookup(const ggml_backend_hexagon_context * ctx, const void * ptr,
+                                       size_t bytes, uint32_t * slot, uint32_t * offset) {
+    if (!ctx->segmented_rpcmem || !ptr) return false;
+    uintptr_t addr = (uintptr_t)ptr;
+    for (const auto & kv : ctx->rpc_segments) {
+        uintptr_t base = (uintptr_t)kv.second.base;
+        if (addr >= base && addr - base < kv.second.size &&
+            bytes <= kv.second.size - (addr - base) && addr - base <= UINT32_MAX) {
+            if (slot) *slot = kv.first;
+            if (offset) *offset = (uint32_t)(addr - base);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggmlhexagon_is_mapped_ptr(const ggml_backend_hexagon_context * ctx, const void * ptr) {
+    uintptr_t addr = (uintptr_t)ptr;
+    uintptr_t base = (uintptr_t)ctx->rpc_mempool;
+    if (addr >= base && addr - base < ctx->rpc_mempool_len) return true;
+    return ggmlhexagon_segment_lookup(ctx, ptr, 1, nullptr, nullptr);
 }
 
 static void ggmlhexagon_deinit_rpcmempool(ggml_backend_hexagon_context * ctx) {
@@ -6909,9 +6959,21 @@ struct ggml_backend_hexagon_buffer_context {
                         }
                     }
                 }
-            } else {
-                GGMLHEXAGON_LOG_ALWAYS("it shouldn't come here");
-                GGML_ABORT("it shouldn't come here");
+            } else if (backend_ctx && segment_id) {
+                auto it = backend_ctx->rpc_segments.find(segment_id);
+                if (it != backend_ctx->rpc_segments.end()) {
+                    const auto seg = it->second;
+                    const int err = backend_ctx->ggmlop_handle ?
+                        ggml_htp_unregister_rpcmem_segment(backend_ctx->ggmlop_handle, segment_id) : AEE_EFAILED;
+                    if (err != AEE_SUCCESS)
+                        GGMLHEXAGON_LOG_WARN("[RPC-SEG] unregister failed: slot=%u err=0x%x", segment_id, err);
+                    backend_ctx->dsp_need_weight_inval_reset = true;
+                    backend_ctx->rpc_segments.erase(it);
+                    fastrpc_munmap(backend_ctx->domain_id, seg.fd, seg.base, seg.size);
+                    ggml_mem_account_mapping_change(seg.base, -1);
+                    ggml_mem_account_pool_destroy(seg.base);
+                    rpcmem_free(seg.base);
+                }
             }
         }
     }
@@ -6919,6 +6981,7 @@ struct ggml_backend_hexagon_buffer_context {
     void * buffer       = nullptr;
     size_t buffer_size  = 0;
     bool   is_mempool_buffer= false;
+    uint32_t segment_id = 0;
 
     struct ggml_backend_hexagon_context * backend_ctx = nullptr;
 };
@@ -6978,7 +7041,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
         switch (tensor->type) {
             case GGML_TYPE_Q4_0:
             case GGML_TYPE_IQ4_NL:  // identical block layout to Q4_0
-                if (dp >= base && dp < end) {
+                if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                     GGMLHEXAGON_LOG_DEBUG("repack");
                     repack_q4_0_tiled(tensor, data, offset, size);
                 } else {
@@ -6987,7 +7050,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 }
                 break;
             case GGML_TYPE_Q4_1:
-                if (dp >= base && dp < end) {
+                if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                     GGMLHEXAGON_LOG_DEBUG("repack");
                     repack_q4_1_tiled(tensor, data, offset, size);
                 } else {
@@ -6996,7 +7059,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 }
                 break;
             case GGML_TYPE_Q8_0: {
-                if (dp >= base && dp < end) {
+                if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                     GGMLHEXAGON_LOG_DEBUG("repack");
                     repack_q8_0_tiled(tensor, data, offset, size);
                 } else {
@@ -7006,7 +7069,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 break;
             }
             case GGML_TYPE_MXFP4:
-                if (dp >= base && dp < end) {
+                if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                     GGMLHEXAGON_LOG_DEBUG("repack");
                     repack_mxfp4_tiled(tensor, data, offset, size);
                 } else {
@@ -7015,7 +7078,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 }
                 break;
             case GGML_TYPE_BF16:
-                if (dp >= base && dp < end) {
+                if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                     GGMLHEXAGON_LOG_DEBUG("repack");
                     repack_bf16_to_f16(tensor, data, offset, size);
                 } else {
@@ -7024,7 +7087,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 }
                 break;
             case GGML_TYPE_Q4_K:
-                if (dp >= base && dp < end) {
+                if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                     GGMLHEXAGON_LOG_DEBUG("repack");
                     repack_q4k_as_q4_0_tiled(tensor, data, offset, size);
                 } else {
@@ -7033,7 +7096,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 }
                 break;
             case GGML_TYPE_Q5_K: {
-                if (dp >= base && dp < end) {
+                if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                     GGMLHEXAGON_LOG_DEBUG("repack");
                     repack_q5k_as_q4_0_tiled(tensor, data, offset, size);
                 } else {
@@ -7043,7 +7106,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 break;
             }
             case GGML_TYPE_Q6_K:
-                if (dp >= base && dp < end) {
+                if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                     GGMLHEXAGON_LOG_DEBUG("repack");
                     repack_q6k_as_q4_0_tiled(tensor, data, offset, size);
                 } else {
@@ -7052,7 +7115,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 }
                 break;
             case GGML_TYPE_Q3_K:
-                if (dp >= base && dp < end) {
+                if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                     GGMLHEXAGON_LOG_DEBUG("repack");
                     repack_q3_K_tiled(tensor, data, offset, size);
                 } else {
@@ -7061,7 +7124,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 }
                 break;
             case GGML_TYPE_Q2_K:
-                if (dp >= base && dp < end) {
+                if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                     GGMLHEXAGON_LOG_DEBUG("repack");
                     repack_q2_K_tiled(tensor, data, offset, size);
                 } else {
@@ -7070,7 +7133,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 }
                 break;
             case GGML_TYPE_Q1_0:
-                if (dp >= base && dp < end) {
+                if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                     GGMLHEXAGON_LOG_DEBUG("repack");
                     repack_q1_0_tiled(tensor, data, offset, size);
                 } else {
@@ -7079,7 +7142,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 }
                 break;
             case GGML_TYPE_Q2_0:
-                if (dp >= base && dp < end) {
+                if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                     GGMLHEXAGON_LOG_DEBUG("repack");
                     repack_q2_0_tiled(tensor, data, offset, size);
                 } else {
@@ -7140,7 +7203,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
             switch (tensor->type) {
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_IQ4_NL:
-                    if (dp >= base && dp < end) {
+                    if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                         GGMLHEXAGON_LOG_DEBUG("unpack");
                         repack_tiled_q4_0(data, tensor, offset, size);
                     } else {
@@ -7149,7 +7212,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
                     }
                     return;
                 case GGML_TYPE_Q4_1:
-                    if (dp >= base && dp < end) {
+                    if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                         GGMLHEXAGON_LOG_DEBUG("unpack");
                         repack_tiled_q4_1(data, tensor, offset, size);
                     } else {
@@ -7158,7 +7221,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
                     }
                     return;
                 case GGML_TYPE_Q8_0:
-                    if (dp >= base && dp < end) {
+                    if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                         GGMLHEXAGON_LOG_DEBUG("unpack");
                         repack_tiled_q8_0(data, tensor, offset, size);
                     } else {
@@ -7167,7 +7230,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
                     }
                     return;
                 case GGML_TYPE_MXFP4:
-                    if (dp >= base && dp < end) {
+                    if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                         GGMLHEXAGON_LOG_DEBUG("unpack");
                         repack_tiled_mxfp4(data, tensor, offset, size);
                     } else {
@@ -7176,7 +7239,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
                     }
                     return;
                 case GGML_TYPE_BF16:
-                    if (dp >= base && dp < end) {
+                    if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                         GGMLHEXAGON_LOG_DEBUG("unpack");
                         repack_f16_to_bf16(tensor, data, offset, size);
                     } else {
@@ -7185,7 +7248,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
                     }
                     return;
                 case GGML_TYPE_Q4_K:
-                    if (dp >= base && dp < end) {
+                    if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                         GGMLHEXAGON_LOG_DEBUG("unpack");
                         repack_tiled_q4_0_to_q4k(data, tensor, offset, size);
                     } else {
@@ -7194,7 +7257,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
                     }
                     return;
                 case GGML_TYPE_Q5_K:
-                    if (dp >= base && dp < end) {
+                    if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                         GGMLHEXAGON_LOG_DEBUG("unpack");
                         repack_tiled_q4_0_to_q5k(data, tensor, offset, size);
                     } else {
@@ -7203,7 +7266,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
                     }
                     return;
                 case GGML_TYPE_Q6_K:
-                    if (dp >= base && dp < end) {
+                    if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                         GGMLHEXAGON_LOG_DEBUG("unpack");
                         repack_tiled_q4_0_to_q6k(data, tensor, offset, size);
                     } else {
@@ -7212,7 +7275,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
                     }
                     return;
                 case GGML_TYPE_Q3_K:
-                    if (dp >= base && dp < end) {
+                    if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                         GGMLHEXAGON_LOG_DEBUG("unpack");
                         repack_tiled_q3_K(data, tensor, offset, size);
                     } else {
@@ -7221,7 +7284,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
                     }
                     return;
                 case GGML_TYPE_Q2_K:
-                    if (dp >= base && dp < end) {
+                    if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                         GGMLHEXAGON_LOG_DEBUG("unpack");
                         repack_tiled_q2_K(data, tensor, offset, size);
                     } else {
@@ -7230,7 +7293,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
                     }
                     return;
                 case GGML_TYPE_Q1_0:
-                    if (dp >= base && dp < end) {
+                    if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                         GGMLHEXAGON_LOG_DEBUG("unpack");
                         repack_tiled_q1_0(data, tensor, offset, size);
                     } else {
@@ -7239,7 +7302,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
                     }
                     return;
                 case GGML_TYPE_Q2_0:
-                    if (dp >= base && dp < end) {
+                    if (ggmlhexagon_is_mapped_ptr(hctx, dp)) {
                         GGMLHEXAGON_LOG_DEBUG("unpack");
                         repack_tiled_q2_0(data, tensor, offset, size);
                     } else {
@@ -7350,6 +7413,59 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
     ggml_backend_hexagon_buffer_context * buffer_ctx = new ggml_backend_hexagon_buffer_context;
     buffer_ctx->backend_ctx = ctx;
     buffer_ctx->is_mempool_buffer = true;
+
+    if (ctx->segmented_rpcmem) {
+        if (size == 0 || size > 1024ull * SIZE_IN_MB) {
+            delete buffer_ctx;
+            return nullptr;
+        }
+        const size_t map_size = ((size + 4095) & ~(size_t)4095) + 4096;
+        uint32_t slot = 0;
+        for (uint32_t s = 1; s < DSP_RPCMEM_MAX_SEGMENTS; s++) {
+            if (ctx->rpc_segments.count(s) == 0) { slot = s; break; }
+        }
+        if (!slot) {
+            GGMLHEXAGON_LOG_ERROR("[RPC-SEG] segment table full");
+            delete buffer_ctx;
+            return nullptr;
+        }
+        void * base = rpcmem_alloc2(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, map_size);
+        if (!base) {
+            GGMLHEXAGON_LOG_ERROR("[RPC-SEG] allocation failed size=%zu", map_size);
+            delete buffer_ctx;
+            return nullptr;
+        }
+        int fd = rpcmem_to_fd(base);
+        const auto flags = g_hexagon_appcfg.rpc_mmap_mode == 1 ? FASTRPC_MAP_FD : FASTRPC_MAP_FD_DELAYED;
+        int err = fd < 0 ? -1 : fastrpc_mmap(ctx->domain_id, fd, base, 0, map_size, flags);
+        if (err != 0) {
+            GGMLHEXAGON_LOG_ERROR("[RPC-SEG] fastrpc_mmap failed slot=%u err=0x%x", slot, err);
+            rpcmem_free(base);
+            delete buffer_ctx;
+            return nullptr;
+        }
+        err = ggml_htp_register_rpcmem_segment(ctx->ggmlop_handle, slot, (uint32_t)fd,
+                                                (uint32_t)map_size, (uint32_t)(map_size >> 32));
+        if (err != AEE_SUCCESS) {
+            GGMLHEXAGON_LOG_ERROR("[RPC-SEG] DSP registration failed slot=%u err=0x%x", slot, err);
+            fastrpc_munmap(ctx->domain_id, fd, base, map_size);
+            rpcmem_free(base);
+            delete buffer_ctx;
+            return nullptr;
+        }
+        ctx->rpc_segments[slot] = {base, map_size, fd};
+        ggml_mem_account_pool_create(base, "HTP_RPCMEM_SEGMENT", map_size);
+        ggml_mem_account_mapping_change(base, +1);
+        buffer_ctx->buffer = base;
+        buffer_ctx->buffer_size = map_size;
+        buffer_ctx->is_mempool_buffer = false;
+        buffer_ctx->segment_id = slot;
+        GGMLHEXAGON_LOG_ALWAYS("[RPC-SEG] mapped slot=%u size=%.2f MiB fd=%d", slot, (double)map_size / SIZE_IN_MB, fd);
+        if (large_alloc) ggmlhexagon_mem_snapshot("after_large_htp_alloc:" + alloc_stage);
+        ggml_backend_buffer_t result = ggml_backend_buffer_init(buft, ggml_backend_hexagon_buffer_interface, buffer_ctx, size);
+        ggml_mem_account_buffer_attach(result, base, 0, map_size);
+        return result;
+    }
 
     size_t size_page = 4096;  // default page size if sysconf is unavailable
 #if defined(__ANDROID__) || defined(__linux__)
@@ -7481,7 +7597,7 @@ static size_t ggml_backend_hexagon_buffer_type_get_alignment(ggml_backend_buffer
 static size_t ggml_backend_hexagon_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
     struct ggml_backend_hexagon_context * ctx = static_cast<ggml_backend_hexagon_context *>(buft->context);
     GGML_ASSERT(nullptr != ctx);
-    return ctx->rpc_mempool_len;
+    return ctx->segmented_rpcmem ? 1024ull * SIZE_IN_MB : ctx->rpc_mempool_len;
 }
 
 static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
@@ -7519,6 +7635,55 @@ static bool ggml_backend_buft_is_hexagon(ggml_backend_buffer_type_t buft) {
 static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer_n(
         ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors) {
     const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    auto * ctx = static_cast<ggml_backend_hexagon_context *>(buft->context);
+    if (ctx->segmented_rpcmem) {
+        const size_t max_chunk = 1024ull * SIZE_IN_MB;
+        std::vector<ggml_backend_buffer_t> chunks;
+        size_t chunk_bytes = 0;
+        int first = 0;
+        auto flush_chunk = [&](int last) -> bool {
+            if (!chunk_bytes) return true;
+            ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft, chunk_bytes);
+            if (!b) return false;
+            struct ggml_tallocr alloc = ggml_tallocr_new(b);
+            for (int j = first; j < last; j++) {
+                ggml_tensor * t = tensors[j];
+                if (t->data != NULL) continue;
+                ggml_status st = t->view_src ? ggml_backend_view_init(t) : ggml_tallocr_alloc(&alloc, t);
+                if (st != GGML_STATUS_SUCCESS) {
+                    ggml_backend_buffer_free(b);
+                    return false;
+                }
+            }
+            chunks.push_back(b);
+            return true;
+        };
+        for (int i = 0; i < n_tensors; i++) {
+            ggml_tensor * t = tensors[i];
+            if (t->data || t->view_src) continue;
+            size_t bytes = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
+            if (bytes > max_chunk) {
+                for (auto * b : chunks) ggml_backend_buffer_free(b);
+                return nullptr;
+            }
+            if (chunk_bytes && bytes > max_chunk - chunk_bytes) {
+                if (!flush_chunk(i)) {
+                    for (auto * b : chunks) ggml_backend_buffer_free(b);
+                    return nullptr;
+                }
+                first = i;
+                chunk_bytes = 0;
+            }
+            chunk_bytes += bytes;
+        }
+        if (!flush_chunk(n_tensors)) {
+            for (auto * b : chunks) ggml_backend_buffer_free(b);
+            return nullptr;
+        }
+        if (chunks.empty()) return nullptr;
+        if (chunks.size() == 1) return chunks[0];
+        return ggml_backend_multi_buffer_alloc_buffer(chunks.data(), chunks.size());
+    }
     size_t total = 0;
     for (int i = 0; i < n_tensors; i++) {
         struct ggml_tensor * t = tensors[i];
@@ -8624,7 +8789,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         if (!t->data) continue;
 
         const char * data_ptr = (const char *)t->data;
-        if (data_ptr >= pool_base && data_ptr < pool_base + (ptrdiff_t)pool_size) {
+        if (ggmlhexagon_is_mapped_ptr(ctx, data_ptr)) {
             continue;  // already in mempool
         }
 
@@ -8641,7 +8806,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         // If root parent lives in the mempool, the view is also in-pool
         // (view data = root data + view_offs, both within pool bounds).
         const char * root_ptr = (const char *)mirror_key;
-        if (root_ptr >= pool_base && root_ptr < pool_base + (ptrdiff_t)pool_size) {
+        if (ggmlhexagon_is_mapped_ptr(ctx, root_ptr)) {
             continue;
         }
 
@@ -8790,7 +8955,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         if (!t->data) continue;
 
         const char * data_ptr = (const char *)t->data;
-        if (data_ptr >= pool_base && data_ptr < pool_base + (ptrdiff_t)pool_size) {
+        if (ggmlhexagon_is_mapped_ptr(ctx, data_ptr)) {
             continue;  // already in mempool
         }
 
@@ -8806,7 +8971,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         if (!mirror_key) continue;
 
         const char * root_ptr = (const char *)mirror_key;
-        if (root_ptr >= pool_base && root_ptr < pool_base + (ptrdiff_t)pool_size) {
+        if (ggmlhexagon_is_mapped_ptr(ctx, root_ptr)) {
             continue;  // root in mempool, view is also in mempool
         }
 
@@ -8980,12 +9145,15 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         td->nb[2] = (int32_t)t->nb[2]; td->nb[3] = (int32_t)t->nb[3];
         memcpy(td->op_params, t->op_params, sizeof(td->op_params));
         td->data_len = (uint32_t)ggml_nbytes(t);
+        td->segment_id = 0;
 
         const char * data_ptr = (const char *)t->data;
         if (data_ptr >= pool_base && data_ptr < pool_base + (ptrdiff_t)pool_size) {
             // mempool tensor: direct offset
             td->data_offset = (uint32_t)(data_ptr - pool_base);
             td->flags = is_weight[i] ? 2 : 0;  // 2=weight (skip NPU first-touch invalidation)
+        } else if (ggmlhexagon_segment_lookup(ctx, data_ptr, ggml_nbytes(t), &td->segment_id, &td->data_offset)) {
+            td->flags = is_weight[i] ? 2 : 0;
         } else {
             // heap tensor: look up mempool offset
             uint32_t moff = local_mirror_offset[i];
@@ -9023,7 +9191,8 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
         bool is_quant_weight = is_weight[i] && t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16;
         if (is_quant_weight) {
             auto it = ctx->tiled_pool_offsets.find(t->data);
-            if (it != ctx->tiled_pool_offsets.end()) {
+            if (it != ctx->tiled_pool_offsets.end() ||
+                (td->segment_id != 0 && t->buffer && ggml_backend_buffer_is_hexagon_repack(t->buffer))) {
                 const int dsp_type = (int)ggml_hexagon_weight_dsp_type(t->type);
                 const int32_t tile_k = (int32_t)htp_tensor_get_tile_k(dsp_type);
                 const int32_t ne0_p = (int32_t)hex_round_up((uint32_t)t->ne[0], (uint32_t)tile_k);
@@ -9038,7 +9207,7 @@ static enum ggml_status ggmlhexagon_backend_graph_compute_batch(ggml_backend_t b
                 td->nb[2] = td->nb[1] * ne1_p;
                 td->nb[3] = td->nb[2] * (int32_t)t->ne[2];
                 td->data_len = (uint32_t)ggml_hexagon_repacked_size(t->type, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
-                td->data_offset = it->second;
+                if (it != ctx->tiled_pool_offsets.end()) td->data_offset = it->second;
                 td->flags = 2;  // weight (skip NPU first-touch invalidation)
             }
         }
