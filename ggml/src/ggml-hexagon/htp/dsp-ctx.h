@@ -125,6 +125,8 @@ struct dsp_op_desc {
  * DSP side accesses data as: mempool_dsp_base + tensor->data_offset
  */
 
+#define DSP_RPCMEM_MAX_SEGMENTS 256
+
 /* Tensor descriptor - uses offset instead of pointer */
 typedef struct hex_tensor_desc {
     int32_t  type;            /* ggml_type */
@@ -134,6 +136,7 @@ typedef struct hex_tensor_desc {
     uint32_t flags;           /* 0=ION tensor, 1=mirrored (heap), 2=weight (skip NPU first-touch invalidation) */
     uint32_t data_offset;     /* byte offset of data in mempool */
     uint32_t data_len;        /* data length in bytes */
+    uint32_t segment_id;      /* 0=workspace, nonzero=registered RPCMEM */
 } hex_tensor_desc;
 
 /* Op descriptor - references tensors by index.
@@ -190,6 +193,10 @@ struct dsp_context {
     // mempool
     void * mempool_dsp_base;
     size_t mempool_dsp_size;
+    struct {
+        void * base;
+        size_t size;
+    } rpc_segments[DSP_RPCMEM_MAX_SEGMENTS];
 
     // DSP-side entry.c cache optimization bitmask. Pushed by AP at init via
     // execute_batch(0xFFFC) special mode (no IDL change). All three bits are
