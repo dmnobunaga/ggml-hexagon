@@ -559,7 +559,9 @@ static size_t ggml_backend_buft_get_alloc_size_n_default(ggml_backend_buffer_typ
 ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_n(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors) {
     GGML_ASSERT(buft);
     if (buft->iface.alloc_buffer_n) {
-        return buft->iface.alloc_buffer_n(buft, tensors, n_tensors);
+        ggml_backend_buffer_t buffer = buft->iface.alloc_buffer_n(buft, tensors, n_tensors);
+        mem_account_buffer_requested(buffer, buft, ggml_backend_buft_name(buft));
+        return buffer;
     }
     return ggml_backend_buft_alloc_buffer_n_default(buft, tensors, n_tensors);
 }
