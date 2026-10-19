@@ -1929,6 +1929,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             const bool is_htp = buft_name && std::strstr(buft_name, "hexagon-ion-buffer") != nullptr;
             const bool is_cpu = !dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ||
                                 (buft_name && std::strncmp(buft_name, "CPU", 3) == 0);
+            // Requested storage is described by GGML buffer types; never by
+            // architecture, layer number or tensor name. No allocation yet.
+            if (const char * diag = std::getenv("GGML_MEM_ACCOUNTING")) {
+                if (std::strcmp(diag, "1") == 0) {
+                    LLAMA_LOG_INFO("[MEM-PLAN] requested=%s device=%s domain=%s bytes=%zu MiB=%.2f\n",
+                        buft_name ? buft_name : "unknown", dev ? ggml_backend_dev_name(dev) : "host",
+                        is_htp ? "HTP" : (is_cpu ? "CPU" : "OTHER"),
+                        bytes, (double) bytes / MiB);
+                }
+            }
 
             if (is_htp) {
                 if (!dev) {
@@ -1949,6 +1959,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
 
         if (!planned_htp.empty()) {
+            llama_model_mem_snapshot("memory_preflight_before_guard");
+            ggml_mem_account_snapshot("memory_preflight_before_guard");
             for (const auto & [dev, plan] : planned_htp) {
                 const size_t htp_reserve = 128 * MiB;
                 const size_t needed = plan.first;
@@ -1956,6 +1968,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 LLAMA_LOG_INFO("[MEM-GUARD] HTP=%s planned=%.2f MiB pool=%.2f MiB compute_reserve=128 MiB\n",
                     ggml_backend_dev_name(dev), (double) needed / MiB, (double) capacity / MiB);
                 if (needed > capacity || capacity - needed < htp_reserve) {
+                    llama_model_mem_snapshot("memory_guard_reject_htp");
+                    ggml_mem_account_snapshot("memory_guard_reject_htp");
                     throw std::runtime_error(format(
                         "[MEM-GUARD] HTP pool too small: planned=%.2f MiB reserve=128 MiB pool=%.2f MiB",
                         (double) needed / MiB, (double) capacity / MiB));
@@ -1994,6 +2008,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_INFO("[MEM-GUARD] MemAvailable=%zu MiB planned_cpu=%zu MiB reserve=%zu MiB required=%zu MiB\n",
                 available_mb, planned_cpu_mb, reserve_mb, planned_cpu_mb + reserve_mb);
             if (planned_cpu_mb > available_mb || reserve_mb > available_mb - planned_cpu_mb) {
+                llama_model_mem_snapshot("memory_guard_reject_cpu");
+                ggml_mem_account_snapshot("memory_guard_reject_cpu");
                 throw std::runtime_error(format(
                     "[MEM-GUARD] insufficient RAM: available=%zu MiB planned_cpu=%zu MiB reserve=%zu MiB",
                     available_mb, planned_cpu_mb, reserve_mb));
