@@ -7419,7 +7419,11 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
             delete buffer_ctx;
             return nullptr;
         }
-        const size_t map_size = ((size + 4095) & ~(size_t)4095) + 4096;
+        size_t map_size = ((size + 4095) & ~(size_t)4095) + 4096;
+        if (ctx->has_extended_map && g_hexagon_appcfg.rpc_mmap_mode == 0) {
+            const size_t align = 2ull * SIZE_IN_MB;
+            map_size = (map_size + align - 1) & ~(align - 1);
+        }
         uint32_t slot = 0;
         for (uint32_t s = 1; s < DSP_RPCMEM_MAX_SEGMENTS; s++) {
             if (ctx->rpc_segments.count(s) == 0) { slot = s; break; }
@@ -7436,7 +7440,8 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
             return nullptr;
         }
         int fd = rpcmem_to_fd(base);
-        const auto flags = g_hexagon_appcfg.rpc_mmap_mode == 1 ? FASTRPC_MAP_FD : FASTRPC_MAP_FD_DELAYED;
+        const auto flags = g_hexagon_appcfg.rpc_mmap_mode == 1 ? FASTRPC_MAP_FD :
+                           ctx->has_extended_map ? FASTRPC_MAP_FD_DELAYED_EXTENDED : FASTRPC_MAP_FD_DELAYED;
         int err = fd < 0 ? -1 : fastrpc_mmap(ctx->domain_id, fd, base, 0, map_size, flags);
         if (err != 0) {
             GGMLHEXAGON_LOG_ERROR("[RPC-SEG] fastrpc_mmap failed slot=%u err=0x%x", slot, err);
