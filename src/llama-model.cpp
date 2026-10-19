@@ -1918,6 +1918,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         const char * segmented_env = std::getenv("GGML_HEXAGON_SEGMENTED_RPCMEM");
         const bool segmented_rpcmem = segmented_env && std::strcmp(segmented_env, "1") == 0;
         std::map<ggml_backend_dev_t, std::pair<size_t, size_t>> planned_htp;
+        bool is_fastrpc_backend = false;
 
         for (auto & [key, ctx_ptr] : ml.ctx_map) {
             ggml_context * ctx = ctx_ptr.get();
@@ -1946,6 +1947,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
 
             if (is_htp) {
+                if (buft_name &&
+                    std::strstr(buft_name, "hexagon-ion-buffer") != nullptr) {
+                    is_fastrpc_backend = true;
+                }
                 if (!dev) {
                     throw std::runtime_error("HTP memory preflight failed: backend device is unavailable");
                 }
@@ -1965,7 +1970,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
 
-        if (!planned_htp.empty()) {
+        if (!planned_htp.empty() && is_fastrpc_backend) {
             llama_model_mem_snapshot("memory_preflight_before_guard");
             ggml_mem_account_snapshot("memory_preflight_before_guard");
             for (const auto & [dev, plan] : planned_htp) {
