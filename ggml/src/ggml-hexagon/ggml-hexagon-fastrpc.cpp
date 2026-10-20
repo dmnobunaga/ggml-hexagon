@@ -7535,6 +7535,11 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
     buffer_ctx->backend_ctx = ctx;
     buffer_ctx->is_mempool_buffer = true;
 
+    if (size == 0) {
+        buffer_ctx->is_mempool_buffer = false;
+        return ggml_backend_buffer_init(buft, ggml_backend_hexagon_buffer_interface, buffer_ctx, 0);
+    }
+
     if (ctx->segmented_rpcmem) {
         if (ctx->rpc_mapping_poisoned) {
             GGMLHEXAGON_LOG_ERROR("[RPC-SEG] refusing allocation after a mapping teardown failure");
