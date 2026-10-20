@@ -196,7 +196,14 @@ struct dsp_context {
     struct {
         void * base;
         size_t size;
+        int32_t fd;
+        uint32_t last_use;
     } rpc_segments[DSP_RPCMEM_MAX_SEGMENTS];
+    uint32_t dsp_va_window_mb;
+    uint32_t dsp_va_tick;
+    uint64_t dsp_va_mapped_bytes;
+    uint64_t dsp_va_map_count;
+    uint64_t dsp_va_evict_count;
 
     // DSP-side entry.c cache optimization bitmask. Pushed by AP at init via
     // execute_batch(0xFFFC) special mode (no IDL change). All three bits are
