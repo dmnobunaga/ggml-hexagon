@@ -7561,7 +7561,6 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
             slot = *best;
             ctx->rpc_segments.at(slot).reserved = false;
             ctx->pending_rpc_segments.erase(best);
-            if (ctx->pending_rpc_segments.empty()) ctx->rpc_reservation_strict = false;
         }
         if (!slot && ctx->rpc_reservation_strict) {
             GGMLHEXAGON_LOG_ERROR("[HTP-OFFLOAD] reserved size mismatch requested=%zu pending=%zu",
