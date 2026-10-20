@@ -393,7 +393,23 @@ static bool llama_adaptive_htp_enabled(const llama_model_params & params, const 
            !path_model.empty() && !metadata && !file;
 }
 
-static bool llama_adaptive_htp_ram_budget(const llama_model & probe, int candidate) {
+static size_t llama_adaptive_htp_available_mb() {
+    FILE * mem = std::fopen("/proc/meminfo", "r");
+    if (!mem) return 0;
+    char line[256];
+    size_t available = 0;
+    while (std::fgets(line, sizeof(line), mem)) {
+        unsigned long long kb = 0;
+        if (std::sscanf(line, "MemAvailable: %llu", &kb) == 1) {
+            available = (size_t)(kb / 1024);
+            break;
+        }
+    }
+    std::fclose(mem);
+    return available;
+}
+
+static bool llama_adaptive_htp_ram_budget(const llama_model & probe, int candidate, size_t available_mb) {
     static constexpr size_t MiB = 1024ull * 1024;
     size_t model_bytes = 0;
     for (const auto & item : probe.memory_breakdown()) {
@@ -407,18 +423,6 @@ static bool llama_adaptive_htp_ram_budget(const llama_model & probe, int candida
         if (end == env || *end || parsed > 8192) return false;
         reserve_mb = (size_t) parsed;
     }
-    size_t available_mb = 0;
-    FILE * mem = std::fopen("/proc/meminfo", "r");
-    if (!mem) return false;
-    char line[256];
-    while (std::fgets(line, sizeof(line), mem)) {
-        unsigned long long kb = 0;
-        if (std::sscanf(line, "MemAvailable: %llu", &kb) == 1) {
-            available_mb = (size_t)(kb / 1024);
-            break;
-        }
-    }
-    std::fclose(mem);
     const size_t required_mb = model_bytes / MiB + (model_bytes % MiB != 0) + reserve_mb;
     LLAMA_LOG_INFO("[HTP-OFFLOAD] candidate=%d model=%.1f MiB reserve=%zu MiB available=%zu MiB\n",
                    candidate, double(model_bytes) / MiB, reserve_mb, available_mb);
@@ -429,26 +433,32 @@ static llama_model * llama_load_adaptive_htp(
         gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & path_model, std::vector<std::string> & splits,
         FILE * file, llama_model_params & params) {
-    using reserve_fn = bool (*)(ggml_backend_dev_t, const size_t *, size_t);
+    using reserve_prefix_fn = size_t (*)(ggml_backend_dev_t, const size_t *, size_t);
+    using can_fit_fn = bool (*)(ggml_backend_dev_t, const size_t *, size_t);
+    using health_fn = bool (*)(ggml_backend_dev_t);
     using rollback_fn = bool (*)(ggml_backend_dev_t);
     ggml_backend_dev_t htp = nullptr;
-    reserve_fn reserve = nullptr;
+    reserve_prefix_fn reserve_prefix = nullptr;
+    can_fit_fn can_fit = nullptr;
+    health_fn healthy = nullptr;
     rollback_fn rollback = nullptr;
 
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto * dev = ggml_backend_dev_get(i);
+        auto * reg = ggml_backend_dev_backend_reg(dev);
         if (std::strcmp(ggml_backend_reg_name(reg), "HTP") != 0) continue;
         if (htp) {
-            LLAMA_LOG_ERROR("[HTP-OFFLOAD] multiple HTP devices are not supported by adaptive reservation\n");
+            LLAMA_LOG_ERROR("[HTP-OFFLOAD] multiple HTP devices are not supported\n");
             return nullptr;
         }
         htp = dev;
-        reserve = reinterpret_cast<reserve_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_reserve_segments"));
+        reserve_prefix = reinterpret_cast<reserve_prefix_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_reserve_prefix"));
+        can_fit = reinterpret_cast<can_fit_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_pending_can_fit"));
+        healthy = reinterpret_cast<health_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_mapping_healthy"));
         rollback = reinterpret_cast<rollback_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_rollback_segments"));
     }
-    if (!htp || !reserve || !rollback) {
-        LLAMA_LOG_ERROR("[HTP-OFFLOAD] segmented HTP reservation interface unavailable\n");
+    if (!htp || !reserve_prefix || !can_fit || !healthy || !rollback) {
+        LLAMA_LOG_ERROR("[HTP-OFFLOAD] transactional HTP reservation interface unavailable\n");
         return nullptr;
     }
 
@@ -464,59 +474,93 @@ static llama_model * llama_load_adaptive_htp(
         return std::unique_ptr<llama_model>(model);
     };
 
-    std::unique_ptr<llama_model> initial = make_probe(0);
-    if (!initial) return nullptr;
-    if (initial->devices.size() != 1 || initial->devices.front().dev != htp) {
-        LLAMA_LOG_ERROR("[HTP-OFFLOAD] only one active HTP device is supported\n");
-        return nullptr;
-    }
-    const int max_layers = initial->hparams.n_layer_all + 1;
-    const int requested = params.n_gpu_layers < 0 ? max_layers : params.n_gpu_layers;
-    int lo = 0;
-    int hi = std::min(requested, max_layers);
-    initial.reset();
-
-    auto try_candidate = [&](int ngl, bool retain) -> bool {
-        auto probe = make_probe(ngl);
-        if (!probe) return false;
-        if (!llama_adaptive_htp_ram_budget(*probe, ngl)) return false;
-
-        const auto & plans = probe->htp_weight_plans;
-        bool ok = true;
-        for (const auto & plan : plans) {
-            if (plan.device != htp || !reserve(htp, plan.chunks.data(), plan.chunks.size())) {
-                ok = false;
-                break;
-            }
-        }
-        probe.reset();
-        if (!ok || !retain) {
-            if (!rollback(htp)) {
-                throw std::runtime_error("[HTP-OFFLOAD] reservation rollback failed");
-            }
-        }
-        LLAMA_LOG_INFO("[HTP-OFFLOAD] candidate=%d reservation=%s\n",
-                       ngl, ok ? "accepted" : "rejected");
-        return ok;
-    };
-
     try {
-        while (lo < hi) {
-            const int mid = lo + (hi - lo + 1) / 2;
-            if (try_candidate(mid, false)) lo = mid;
-            else hi = mid - 1;
-        }
-        if (lo > 0 && !try_candidate(lo, true)) {
-            LLAMA_LOG_ERROR("[HTP-OFFLOAD] final reservation failed after search\n");
-            rollback(htp);
+        const size_t initial_available = llama_adaptive_htp_available_mb();
+        auto initial = make_probe(params.n_gpu_layers);
+        if (!initial || !initial_available) return nullptr;
+        if (initial->devices.size() != 1 || initial->devices.front().dev != htp) {
+            LLAMA_LOG_ERROR("[HTP-OFFLOAD] only one active HTP device is supported\n");
             return nullptr;
         }
+        const int max_layers = initial->hparams.n_layer_all + 1;
+        const int requested = params.n_gpu_layers < 0 ? max_layers : std::min(params.n_gpu_layers, max_layers);
+        int upper = requested;
+
+        if (!llama_adaptive_htp_ram_budget(*initial, requested, initial_available)) {
+            int lo = 0;
+            int hi = requested - 1;
+            while (lo < hi) {
+                int mid = lo + (hi - lo + 1) / 2;
+                auto probe = make_probe(mid);
+                if (!probe) return nullptr;
+                if (llama_adaptive_htp_ram_budget(*probe, mid, initial_available)) lo = mid;
+                else hi = mid - 1;
+            }
+            upper = lo;
+        }
+
+        std::unique_ptr<llama_model> upper_probe;
+        if (upper == requested) {
+            upper_probe = std::move(initial);
+        } else {
+            initial.reset();
+            upper_probe = make_probe(upper);
+            if (!upper_probe || !llama_adaptive_htp_ram_budget(*upper_probe, upper, initial_available)) {
+                LLAMA_LOG_ERROR("[HTP-OFFLOAD] no model configuration fits system RAM budget\n");
+                return nullptr;
+            }
+        }
+        std::vector<size_t> requested_chunks;
+        for (const auto & plan : upper_probe->htp_weight_plans) {
+            if (plan.device != htp) return nullptr;
+            requested_chunks.insert(requested_chunks.end(), plan.chunks.begin(), plan.chunks.end());
+        }
+        upper_probe.reset();
+
+        size_t mapped = 0;
+        if (!requested_chunks.empty()) {
+            mapped = reserve_prefix(htp, requested_chunks.data(), requested_chunks.size());
+            if (!healthy(htp)) {
+                LLAMA_LOG_ERROR("[HTP-OFFLOAD] DSP mapping teardown failed; refusing further allocations\n");
+                rollback(htp);
+                return nullptr;
+            }
+        }
+        LLAMA_LOG_INFO("[HTP-OFFLOAD] mapped=%zu/%zu weight segments; selecting layers without remapping\n",
+                       mapped, requested_chunks.size());
+
+        int lo = 0;
+        int hi = upper;
+        while (lo < hi) {
+            int mid = lo + (hi - lo + 1) / 2;
+            auto probe = make_probe(mid);
+            if (!probe) {
+                rollback(htp);
+                return nullptr;
+            }
+            std::vector<size_t> sizes;
+            for (const auto & plan : probe->htp_weight_plans) {
+                if (plan.device != htp) {
+                    rollback(htp);
+                    return nullptr;
+                }
+                sizes.insert(sizes.end(), plan.chunks.begin(), plan.chunks.end());
+            }
+            if (llama_adaptive_htp_ram_budget(*probe, mid, initial_available) &&
+                can_fit(htp, sizes.data(), sizes.size())) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
         params.n_gpu_layers = lo;
+        if (lo == 0 && !rollback(htp)) return nullptr;
+
         LLAMA_LOG_INFO("[HTP-OFFLOAD] requested=%d effective_ngl=%d\n", requested, lo);
         const auto [status, loaded] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud,
                                                        path_model, splits, file, params);
         if (!rollback(htp)) {
-            LLAMA_LOG_ERROR("[HTP-OFFLOAD] remaining reservations could not be released\n");
+            LLAMA_LOG_ERROR("[HTP-OFFLOAD] failed to release unused reservations\n");
             if (loaded) llama_model_free(loaded);
             return nullptr;
         }
