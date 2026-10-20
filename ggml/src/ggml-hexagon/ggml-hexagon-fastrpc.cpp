@@ -202,6 +202,7 @@ struct ggml_backend_hexagon_context {
     bool   dsp_need_weight_inval_reset;         // set by free_buffer on model unload, sent to NPU via 0xFFFC before next batch
     std::vector<ion_pool_region> ion_regions;   // region tracking for mempool free-space management
     bool segmented_rpcmem = false;
+    uint32_t dsp_va_window_mb = 0;
     bool rpc_mapping_poisoned = false;
     bool rpc_reservation_strict = false;
     std::map<uint32_t, ggmlhexagon_rpc_segment> rpc_segments;
@@ -1949,6 +1950,19 @@ static int ggmlhexagon_init_rpcmempool(ggml_backend_hexagon_context * ctx) {
 
     const char * segmented_env = getenv("GGML_HEXAGON_SEGMENTED_RPCMEM");
     ctx->segmented_rpcmem = segmented_env && strcmp(segmented_env, "1") == 0;
+    ctx->dsp_va_window_mb = 0;
+    if (const char * window_env = getenv("GGML_HEXAGON_DSP_VA_WINDOW_MB")) {
+        char * end = nullptr;
+        errno = 0;
+        long window_mb = strtol(window_env, &end, 10);
+        if (errno || end == window_env || *end || window_mb < 512 || window_mb > 3072 ||
+            window_mb % 64 || !ctx->segmented_rpcmem) {
+            GGMLHEXAGON_LOG_ERROR("[DSP-VA] GGML_HEXAGON_DSP_VA_WINDOW_MB requires segmented RPCMEM and a 64-MiB multiple in 512..3072");
+            return 3;
+        }
+        ctx->dsp_va_window_mb = (uint32_t)window_mb;
+        GGMLHEXAGON_LOG_ALWAYS("[DSP-VA] opt-in DSP weight VA window=%u MiB", ctx->dsp_va_window_mb);
+    }
 
     int htp_arch = 0;
     htp_arch = ggmlhexagon_probe_dspinfo(ctx);
@@ -2455,13 +2469,19 @@ static int ggmlhexagon_init_dsp(ggml_backend_hexagon_context * ctx) {
             const uint32_t power_bits   = (((uint32_t)g_hexagon_appcfg.power_mode & 0xFu) << 8) | 0x1000u;
             const uint32_t trace_bit0   = (g_hexagon_appcfg.dsp_cache_trace_bit0 ? 0x10000u : 0u);
             const uint32_t trace_bit1   = (g_hexagon_appcfg.dsp_cache_trace_bit1 ? 0x20000u : 0u);
-            const uint32_t payload      = trace_bit1 | trace_bit0 | power_bits | mode_bits;
+            const uint32_t window_bits = ctx->dsp_va_window_mb ?
+                (0x80000000u | ((ctx->dsp_va_window_mb / 64u) << 18)) : 0u;
+            const uint32_t payload      = trace_bit1 | trace_bit0 | power_bits | mode_bits | window_bits;
             int opts_err = ggml_htp_execute_batch(ctx->ggmlop_handle, payload, 0xFFFC);
             if (AEE_SUCCESS != opts_err) {
                 GGMLHEXAGON_LOG_WARN("set dsp_cache_mode=0x%x + power_mode=%s + dsp_cache_trace_bit0=%d + dsp_cache_trace_bit1=%d failed: 0x%x (NPU-side optimizations disabled)",
                                      mode_bits, ggmlhexagon_power_mode_to_str(g_hexagon_appcfg.power_mode),
                                      g_hexagon_appcfg.dsp_cache_trace_bit0,
                                      g_hexagon_appcfg.dsp_cache_trace_bit1, opts_err);
+                if (ctx->dsp_va_window_mb) {
+                    GGMLHEXAGON_LOG_ERROR("[DSP-VA] DSP rejected VA window setup; refusing unsafe eager allocation");
+                    return 9;
+                }
                 g_hexagon_appcfg.dsp_cache_mode = 0;  // fall back to baseline
                 g_hexagon_appcfg.dsp_cache_trace_bit0 = 0;
                 g_hexagon_appcfg.dsp_cache_trace_bit1 = 0;
