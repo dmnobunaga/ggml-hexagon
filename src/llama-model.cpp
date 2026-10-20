@@ -2218,6 +2218,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             bufs.emplace_back(buf);
         }
 
+        if (adaptive_htp && !ml.no_alloc && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            const bool mapped_cpu = (ml.use_mmap || is_lazy_mapped) &&
+                                    use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft;
+            size_t & weight_bytes = mapped_cpu ? htp_cpu_mmap_weight_bytes : htp_cpu_anon_weight_bytes;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->view_src) continue;
+                const size_t bytes = ggml_backend_buft_get_alloc_size(buft, t);
+                if (bytes > SIZE_MAX - weight_bytes) {
+                    throw std::runtime_error("[HTP-OFFLOAD] CPU weight size overflow");
+                }
+                weight_bytes += bytes;
+            }
+        }
+
         std::vector<ggml_backend_buffer_t> buf_ptrs;
         buf_ptrs.reserve(bufs.size());
 
