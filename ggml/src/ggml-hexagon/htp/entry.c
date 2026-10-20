@@ -2334,6 +2334,15 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
                 if (!dsp_va_prepare_op(needed)) {
                     return AEE_EFAILED;
                 }
+                // Weight VA may be reused for a different physical segment.
+                // Per-batch tensor invalidation must not preserve old addresses.
+                // Do not reset activation flags: DSP-written intermediates may
+                // still reside only in L2 and must not be invalidated again.
+                for (uint32_t ti = 0; ti < hdr->n_tensors; ti++) {
+                    if (tens[ti].segment_id) {
+                        g_dsp_ctx->batch_tensor_needs_inval[ti] = 1;
+                    }
+                }
                 dsp_queues_wakeup();
             }
             for (int k = 0; k < HTP_OP_MAX_INPUTS + HTP_OP_MAX_OUTPUTS; k++) {
