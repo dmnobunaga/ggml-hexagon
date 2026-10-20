@@ -393,44 +393,6 @@ static bool llama_adaptive_htp_enabled(const llama_model_params & params, const 
            !path_model.empty() && !metadata && !file;
 }
 
-static size_t llama_adaptive_htp_available_mb() {
-    FILE * mem = std::fopen("/proc/meminfo", "r");
-    if (!mem) return 0;
-    char line[256];
-    size_t available = 0;
-    while (std::fgets(line, sizeof(line), mem)) {
-        unsigned long long kb = 0;
-        if (std::sscanf(line, "MemAvailable: %llu", &kb) == 1) {
-            available = (size_t)(kb / 1024);
-            break;
-        }
-    }
-    std::fclose(mem);
-    return available;
-}
-
-static bool llama_adaptive_htp_ram_budget(const llama_model & probe, int candidate, size_t available_mb) {
-    static constexpr size_t MiB = 1024ull * 1024;
-    size_t model_bytes = 0;
-    for (const auto & item : probe.memory_breakdown()) {
-        if (item.second > SIZE_MAX - model_bytes) return false;
-        model_bytes += item.second;
-    }
-    size_t reserve_mb = 1536;
-    if (const char * env = std::getenv("GGML_HEXAGON_MEMORY_RESERVE_MB")) {
-        char * end = nullptr;
-        unsigned long parsed = std::strtoul(env, &end, 10);
-        if (end == env || *end || parsed > 8192) return false;
-        reserve_mb = (size_t) parsed;
-    }
-    const size_t required_mb = model_bytes / MiB + (model_bytes % MiB != 0) + reserve_mb;
-    const bool fits = available_mb && required_mb <= available_mb;
-    LLAMA_LOG_WARN("[HTP-OFFLOAD] RAM preflight: ngl=%d model=%.1f MiB reserve=%zu MiB required=%zu MiB available=%zu MiB result=%s\n",
-                   candidate, double(model_bytes) / MiB, reserve_mb, required_mb, available_mb,
-                   fits ? "PASS" : "REJECT");
-    return fits;
-}
-
 static llama_model * llama_load_adaptive_htp(
         gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & path_model, std::vector<std::string> & splits,
@@ -479,50 +441,16 @@ static llama_model * llama_load_adaptive_htp(
     try {
         auto initial = make_probe(params.n_gpu_layers);
         if (!initial) return nullptr;
-        const size_t initial_available = llama_adaptive_htp_available_mb();
-        if (!initial_available) return nullptr;
         if (initial->devices.size() != 1 || initial->devices.front().dev != htp) {
             LLAMA_LOG_ERROR("[HTP-OFFLOAD] only one active HTP device is supported\n");
             return nullptr;
         }
         const int max_layers = initial->hparams.n_layer_all + 1;
         const int requested = params.n_gpu_layers < 0 ? max_layers : std::min(params.n_gpu_layers, max_layers);
-        int upper = requested;
-
-        if (!llama_adaptive_htp_ram_budget(*initial, requested, initial_available)) {
-            if (requested == 0) {
-                LLAMA_LOG_ERROR("[HTP-OFFLOAD] CPU-only model exceeds RAM budget; offload cannot resolve this\n");
-                return nullptr;
-            }
-            auto cpu_probe = make_probe(0);
-            if (!cpu_probe || !llama_adaptive_htp_ram_budget(*cpu_probe, 0, initial_available)) {
-                LLAMA_LOG_ERROR("[HTP-OFFLOAD] CPU-only model also exceeds RAM budget. Check MemAvailable, resident RAM use, and reserve setting before testing DSP mappings.\n");
-                return nullptr;
-            }
-            cpu_probe.reset();
-            int lo = 0;
-            int hi = requested - 1;
-            while (lo < hi) {
-                int mid = lo + (hi - lo + 1) / 2;
-                auto probe = make_probe(mid);
-                if (!probe) return nullptr;
-                if (llama_adaptive_htp_ram_budget(*probe, mid, initial_available)) lo = mid;
-                else hi = mid - 1;
-            }
-            upper = lo;
-        }
-
-        std::unique_ptr<llama_model> upper_probe;
-        if (upper == requested) {
-            upper_probe = std::move(initial);
-        } else {
-            initial.reset();
-            upper_probe = make_probe(upper);
-            if (!upper_probe || !llama_adaptive_htp_ram_budget(*upper_probe, upper, initial_available)) {
-                LLAMA_LOG_ERROR("[HTP-OFFLOAD] RAM preflight rejected every candidate. Lowering ngl cannot make the model safe with the current MemAvailable and reserve. No DSP weights were allocated.\n");
-                return nullptr;
-            }
-        }
+        const int upper = requested;
+        std::unique_ptr<llama_model> upper_probe = std::move(initial);
+        LLAMA_LOG_INFO("[HTP-OFFLOAD] requested=%d; selecting against DSP mappings (RAM checked by MEM-GUARD before weight allocations)\n",
+                       requested);
         std::vector<size_t> requested_chunks;
         for (const auto & plan : upper_probe->htp_weight_plans) {
             if (plan.device != htp) return nullptr;
@@ -559,8 +487,7 @@ static llama_model * llama_load_adaptive_htp(
                 }
                 sizes.insert(sizes.end(), plan.chunks.begin(), plan.chunks.end());
             }
-            if (llama_adaptive_htp_ram_budget(*probe, mid, initial_available) &&
-                can_fit(htp, sizes.data(), sizes.size())) {
+            if (can_fit(htp, sizes.data(), sizes.size())) {
                 lo = mid;
             } else {
                 hi = mid - 1;
