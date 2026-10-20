@@ -7549,7 +7549,7 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
         uint32_t slot = 0;
         for (auto it = ctx->pending_rpc_segments.begin(); it != ctx->pending_rpc_segments.end(); ++it) {
             auto sit = ctx->rpc_segments.find(*it);
-            if (sit != ctx->rpc_segments.end() && sit->second.reserved && sit->second.requested_size == size) {
+            if (sit != ctx->rpc_segments.end() && sit->second.reserved && sit->second.requested_size >= size) {
                 slot = *it;
                 sit->second.reserved = false;
                 ctx->pending_rpc_segments.erase(it);
@@ -10178,6 +10178,48 @@ static size_t ggml_backend_hexagon_pending_reserved_bytes(ggml_backend_dev_t dev
     return total;
 }
 
+static size_t ggml_backend_hexagon_reserve_prefix(ggml_backend_dev_t dev, const size_t * sizes, size_t count) {
+    auto * ctx = static_cast<ggml_backend_hexagon_context *>(dev ? dev->context : nullptr);
+    if (!ctx || !ctx->segmented_rpcmem || ctx->rpc_mapping_poisoned || (!sizes && count)) return 0;
+    size_t accepted = 0;
+    for (size_t i = 0; i < count; i++) {
+        uint32_t slot = ggmlhexagon_rpc_segment_allocate(ctx, sizes[i], true);
+        if (!slot) break;
+        ctx->pending_rpc_segments.push_back(slot);
+        ctx->rpc_reservation_strict = true;
+        accepted++;
+    }
+    GGMLHEXAGON_LOG_ALWAYS("[HTP-OFFLOAD] DSP segment prefix mapped=%zu/%zu", accepted, count);
+    return accepted;
+}
+
+static bool ggml_backend_hexagon_pending_can_fit(ggml_backend_dev_t dev,
+                                                  const size_t * sizes, size_t count) {
+    auto * ctx = static_cast<ggml_backend_hexagon_context *>(dev ? dev->context : nullptr);
+    if (!ctx || !ctx->segmented_rpcmem || ctx->rpc_mapping_poisoned || (!sizes && count)) return false;
+    std::vector<size_t> capacity;
+    for (uint32_t slot : ctx->pending_rpc_segments) {
+        auto it = ctx->rpc_segments.find(slot);
+        if (it != ctx->rpc_segments.end() && it->second.reserved) {
+            capacity.push_back(it->second.requested_size);
+        }
+    }
+    std::sort(capacity.begin(), capacity.end());
+    std::vector<size_t> requests(sizes, sizes + count);
+    std::sort(requests.begin(), requests.end(), std::greater<size_t>());
+    for (size_t request : requests) {
+        auto it = std::lower_bound(capacity.begin(), capacity.end(), request);
+        if (it == capacity.end()) return false;
+        capacity.erase(it);
+    }
+    return true;
+}
+
+static bool ggml_backend_hexagon_mapping_healthy(ggml_backend_dev_t dev) {
+    auto * ctx = static_cast<ggml_backend_hexagon_context *>(dev ? dev->context : nullptr);
+    return ctx && !ctx->rpc_mapping_poisoned;
+}
+
 static bool ggml_backend_hexagon_reserve_segments(ggml_backend_dev_t dev, const size_t * sizes, size_t count) {
     auto * ctx = static_cast<ggml_backend_hexagon_context *>(dev ? dev->context : nullptr);
     return ggmlhexagon_rpc_segment_reserve(ctx, sizes, count);
@@ -10194,6 +10236,15 @@ static void * ggml_backend_hexagon_reg_get_proc_address(ggml_backend_reg_t reg, 
     if (nullptr == name)
         return nullptr;
 
+    if (0 == strcmp(name, "ggml_backend_hexagon_reserve_prefix")) {
+        return (void *)ggml_backend_hexagon_reserve_prefix;
+    }
+    if (0 == strcmp(name, "ggml_backend_hexagon_pending_can_fit")) {
+        return (void *)ggml_backend_hexagon_pending_can_fit;
+    }
+    if (0 == strcmp(name, "ggml_backend_hexagon_mapping_healthy")) {
+        return (void *)ggml_backend_hexagon_mapping_healthy;
+    }
     if (0 == strcmp(name, "ggml_backend_hexagon_pending_reserved_bytes")) {
         return (void *)ggml_backend_hexagon_pending_reserved_bytes;
     }
