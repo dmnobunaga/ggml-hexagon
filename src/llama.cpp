@@ -571,7 +571,7 @@ static llama_model * llama_load_adaptive_htp(
             if (loaded) llama_model_free(loaded);
             return nullptr;
         }
-        if (status != 0) {
+        if (status != 0 || !loaded) {
             if (loaded) llama_model_free(loaded);
             return nullptr;
         }
