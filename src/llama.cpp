@@ -585,6 +585,8 @@ static llama_model * llama_load_adaptive_htp(
         const double mib = 1024.0 * 1024.0;
         std::fprintf(stderr, "[HTP-OFFLOAD] SUMMARY (after model weight load)\n");
         std::fprintf(stderr, "[HTP-OFFLOAD]   requested_ngl            = %d (clamped=%d)\n", original_ngl, requested);
+        std::fprintf(stderr, "[HTP-OFFLOAD]   segment_chunk_cap        = %s MiB\n",
+                     std::getenv("GGML_HEXAGON_SEGMENT_MB") ? std::getenv("GGML_HEXAGON_SEGMENT_MB") : "1024");
         std::fprintf(stderr, "[HTP-OFFLOAD]   effective_ngl            = %d\n", lo);
         std::fprintf(stderr, "[HTP-OFFLOAD]   registered_prefix        = %zu/%zu segments\n", mapped, requested_chunks.size());
         std::fprintf(stderr, "[HTP-OFFLOAD]   dsp_weight_segments      = %zu\n", segment_count);
