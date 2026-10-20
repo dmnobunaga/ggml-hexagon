@@ -10187,11 +10187,48 @@ static size_t ggml_backend_hexagon_pending_reserved_bytes(ggml_backend_dev_t dev
     return total;
 }
 
+static bool ggmlhexagon_rpcmem_host_headroom(size_t next_bytes) {
+#if defined(__ANDROID__)
+    size_t reserve_mb = 1536;
+    if (const char * env = std::getenv("GGML_HEXAGON_MEMORY_RESERVE_MB")) {
+        char * end = nullptr;
+        errno = 0;
+        long parsed = std::strtol(env, &end, 10);
+        if (errno != 0 || end == env || *end || parsed < 0 || parsed > 8192) {
+            GGMLHEXAGON_LOG_ERROR("[HTP-OFFLOAD] invalid memory reserve setting");
+            return false;
+        }
+        reserve_mb = (size_t) parsed;
+    }
+    FILE * mem = std::fopen("/proc/meminfo", "r");
+    if (!mem) {
+        GGMLHEXAGON_LOG_ERROR("[HTP-OFFLOAD] cannot inspect MemAvailable");
+        return false;
+    }
+    unsigned long long available_kib = 0;
+    char line[256];
+    while (std::fgets(line, sizeof(line), mem)) {
+        if (std::sscanf(line, "MemAvailable: %llu", &available_kib) == 1) break;
+    }
+    std::fclose(mem);
+    const size_t available_mb = (size_t) (available_kib / 1024);
+    const size_t next_mb = next_bytes / SIZE_IN_MB + (next_bytes % SIZE_IN_MB != 0) + 2;
+    const bool fits = available_mb > reserve_mb && next_mb <= available_mb - reserve_mb;
+    GGMLHEXAGON_LOG_ALWAYS("[HTP-OFFLOAD] host headroom: available=%zu MiB next=%zu MiB reserve=%zu MiB %s",
+                           available_mb, next_mb, reserve_mb, fits ? "PASS" : "STOP");
+    return fits;
+#else
+    GGML_UNUSED(next_bytes);
+    return true;
+#endif
+}
+
 static size_t ggml_backend_hexagon_reserve_prefix(ggml_backend_dev_t dev, const size_t * sizes, size_t count) {
     auto * ctx = static_cast<ggml_backend_hexagon_context *>(dev ? dev->context : nullptr);
     if (!ctx || !ctx->segmented_rpcmem || ctx->rpc_mapping_poisoned || (!sizes && count)) return 0;
     size_t accepted = 0;
     for (size_t i = 0; i < count; i++) {
+        if (!ggmlhexagon_rpcmem_host_headroom(sizes[i])) break;
         uint32_t slot = ggmlhexagon_rpc_segment_allocate(ctx, sizes[i], true);
         if (!slot) break;
         ctx->pending_rpc_segments.push_back(slot);
