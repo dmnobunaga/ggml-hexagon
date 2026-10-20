@@ -2120,6 +2120,10 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
      *               invalidated after model unload/reload. */
     if (batch_size == 0xFFFC) {
         g_dsp_ctx->dsp_cache_mode = batch_offset & 0xFu;
+        if (batch_offset & 0x80000000u) {
+            g_dsp_ctx->dsp_va_window_mb = ((batch_offset >> 18) & 0x3Fu) * 64u;
+            FARF(ALWAYS, "[DSP-VA] weight mapping window=%u MiB", g_dsp_ctx->dsp_va_window_mb);
+        }
         g_dsp_ctx->dsp_cache_trace_bit0 = (batch_offset >> 16) & 0x1u;
         g_dsp_ctx->dsp_cache_trace_bit1 = (batch_offset >> 17) & 0x1u;
         if (batch_offset & 0x10u) {
@@ -2234,7 +2238,10 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
         const uint32_t slot = tens[ti].segment_id;
         if (slot >= DSP_RPCMEM_MAX_SEGMENTS) return AEE_EBADPARM;
         const size_t capacity = slot ? g_dsp_ctx->rpc_segments[slot].size : g_dsp_ctx->mempool_dsp_size;
-        if ((slot && !g_dsp_ctx->rpc_segments[slot].base) || off >= capacity || len > capacity - off) {
+        if ((slot && !g_dsp_ctx->rpc_segments[slot].size) ||
+            (slot && !g_dsp_ctx->dsp_va_window_mb && !g_dsp_ctx->rpc_segments[slot].base) ||
+            (slot && g_dsp_ctx->dsp_va_window_mb && !(tens[ti].flags & 2u)) ||
+            off >= capacity || len > capacity - off) {
             GGMLHEXAGON_LOG_ERROR("tensor %u: invalid segment=%u off=%u len=%u cap=%zu",
                                   ti, slot, off, len, capacity);
             return AEE_EBADPARM;
@@ -2271,8 +2278,10 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
     for (uint32_t ti = 0; ti < hdr->n_tensors; ti++) {
         const uint32_t slot = tens[ti].segment_id;
         const char * tensor_base = slot ? (const char *)g_dsp_ctx->rpc_segments[slot].base : base;
-        hex_tensor_to_dsptensor(&tens[ti], tensor_base, &g_dsp_ctx->pre_dt[ti]);
-        hex_tensor_to_htp_tensor(&tens[ti], tensor_base, &g_dsp_ctx->pre_ht[ti]);
+        if (!slot || !g_dsp_ctx->dsp_va_window_mb) {
+            hex_tensor_to_dsptensor(&tens[ti], tensor_base, &g_dsp_ctx->pre_dt[ti]);
+            hex_tensor_to_htp_tensor(&tens[ti], tensor_base, &g_dsp_ctx->pre_ht[ti]);
+        }
     }
 #if HEX_OP_PROF
     g_dsp_ctx->nonop_preconvert_us += (uint64_t)(ggml_time_us() - prof_pre_t0);
@@ -2308,6 +2317,35 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
 
     for (uint32_t i = 0; i < hdr->n_ops; i++) {
         const hex_op_desc * op = &ops[i];
+
+        if (g_dsp_ctx->dsp_va_window_mb) {
+            uint8_t needed[DSP_RPCMEM_MAX_SEGMENTS] = {0};
+            bool need_map = false;
+            for (int k = 0; k < HTP_OP_MAX_INPUTS + HTP_OP_MAX_OUTPUTS; k++) {
+                int32_t ti = k < HTP_OP_MAX_INPUTS ? op->src_idx[k] : op->dst_idx[k - HTP_OP_MAX_INPUTS];
+                if (ti < 0) continue;
+                uint32_t slot = tens[ti].segment_id;
+                if (!slot) continue;
+                needed[slot] = 1;
+                if (!g_dsp_ctx->rpc_segments[slot].base) need_map = true;
+            }
+            if (need_map) {
+                dsp_queues_suspend();
+                if (!dsp_va_prepare_op(needed)) {
+                    return AEE_EFAILED;
+                }
+                dsp_queues_wakeup();
+            }
+            for (int k = 0; k < HTP_OP_MAX_INPUTS + HTP_OP_MAX_OUTPUTS; k++) {
+                int32_t ti = k < HTP_OP_MAX_INPUTS ? op->src_idx[k] : op->dst_idx[k - HTP_OP_MAX_INPUTS];
+                if (ti < 0) continue;
+                uint32_t slot = tens[ti].segment_id;
+                if (!slot) continue;
+                const char * tensor_base = (const char *)g_dsp_ctx->rpc_segments[slot].base;
+                hex_tensor_to_dsptensor(&tens[ti], tensor_base, &g_dsp_ctx->pre_dt[ti]);
+                hex_tensor_to_htp_tensor(&tens[ti], tensor_base, &g_dsp_ctx->pre_ht[ti]);
+            }
+        }
 
         /* srcs: reference pre-converted tensors directly */
         const dsptensor *src0_dt = &g_dsp_ctx->pre_dt[op->src_idx[0]];
@@ -2571,7 +2609,7 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
         const hex_tensor_desc * last = &tens[ops[hdr->n_ops - 1].dst_idx[0]];
         const size_t last_cap = last->segment_id ? g_dsp_ctx->rpc_segments[last->segment_id].size : g_dsp_ctx->mempool_dsp_size;
         const char * last_base = last->segment_id ? (const char *)g_dsp_ctx->rpc_segments[last->segment_id].base : base;
-        if (last->data_offset < last_cap && last_cap - last->data_offset >= sizeof(int))
+        if (last_base && last->data_offset < last_cap && last_cap - last->data_offset >= sizeof(int))
             (void) *(volatile const int *)(last_base + last->data_offset);
     }
     __asm__ __volatile__("" ::: "memory");
