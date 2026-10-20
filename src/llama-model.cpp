@@ -1982,12 +1982,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     throw std::runtime_error("CPU memory preflight failed: size overflow");
                 }
                 planned_cpu += bytes;
-                if (adaptive_htp && ml.use_mmap && dev &&
-                    ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                // The standard CPU buffer type currently has a NULL .device.
+                // Use the same CPU-device fallback as the actual allocation loop.
+                ggml_backend_dev_t cpu_buft_dev = dev ? dev :
+                    ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (adaptive_htp && ml.use_mmap && cpu_buft_dev &&
+                    ggml_backend_dev_type(cpu_buft_dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
                     ggml_backend_dev_props props;
-                    ggml_backend_dev_get_props(dev, &props);
+                    ggml_backend_dev_get_props(cpu_buft_dev, &props);
                     if (props.caps.buffer_from_host_ptr &&
-                        buft == ggml_backend_dev_buffer_type(dev)) {
+                        buft == ggml_backend_dev_buffer_type(cpu_buft_dev)) {
                         planned_cpu_mmap += bytes;
                     }
                 }
