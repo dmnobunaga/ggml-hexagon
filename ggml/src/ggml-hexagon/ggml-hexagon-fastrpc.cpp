@@ -2216,11 +2216,15 @@ static bool ggmlhexagon_rpc_segment_rollback_pending(ggml_backend_hexagon_contex
     return ok;
 }
 
-static void ggmlhexagon_deinit_rpcmempool(ggml_backend_hexagon_context * ctx) {
+static void ggmlhexagon_deinit_rpc_segments(ggml_backend_hexagon_context * ctx) {
     std::vector<uint32_t> slots;
     for (const auto & kv : ctx->rpc_segments) slots.push_back(kv.first);
     for (uint32_t slot : slots) ggmlhexagon_rpc_segment_release(ctx, slot);
     ctx->pending_rpc_segments.clear();
+}
+
+static void ggmlhexagon_deinit_rpcmempool(ggml_backend_hexagon_context * ctx) {
+    ggmlhexagon_deinit_rpc_segments(ctx);
     if (ctx->rpc_mempool) {
         ggmlhexagon_rpcmem_fd_snapshot(ctx, "before_rpcmem_free");
         ggmlhexagon_mem_snapshot("before_rpcmem_free:HTP" + std::to_string(ctx->device));
@@ -2241,13 +2245,15 @@ static void ggmlhexagon_deinit_cdsp(ggml_backend_hexagon_context * ctx) {
     GGMLHEXAGON_LOG_ALWAYS("enter %s", __FUNCTION__);
     int hexagon_error  = AEE_SUCCESS;
     if (ctx->ggmlop_handle != 0) {
+        ggmlhexagon_deinit_rpc_segments(ctx);
         hexagon_error = ggml_htp_close(ctx->ggmlop_handle);
         if (AEE_SUCCESS != hexagon_error) {
             GGMLHEXAGON_LOG_ERROR("error 0x%x: failed to close ggmlop dsp handle", hexagon_error);
         }
-        ctx->ggmlop_handle = 0;
+        if (hexagon_error == AEE_SUCCESS) ctx->ggmlop_handle = 0;
     }
-    ggmlhexagon_deinit_rpcmempool(ctx);
+    if (ctx->ggmlop_handle == 0) ggmlhexagon_deinit_rpcmempool(ctx);
+    else GGMLHEXAGON_LOG_ERROR("[RPC-SEG] DSP close failed; retaining unresolved mappings");
     //Probe before domain_id is invalidated so AP-side domain queries still work
     if (ctx->domain_id >= 0) {
         ggmlhexagon_probe_dspinfo(ctx);
