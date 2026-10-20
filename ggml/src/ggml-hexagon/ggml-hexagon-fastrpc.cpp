@@ -152,6 +152,10 @@ struct ggmlhexagon_rpc_segment {
     void * base = nullptr;
     size_t size = 0;
     int fd = -1;
+    size_t requested_size = 0;
+    bool reserved = false;
+    bool registered = false;
+    bool accounted = false;
 };
 
 struct ion_pool_region {
@@ -196,7 +200,9 @@ struct ggml_backend_hexagon_context {
     bool   dsp_need_weight_inval_reset;         // set by free_buffer on model unload, sent to NPU via 0xFFFC before next batch
     std::vector<ion_pool_region> ion_regions;   // region tracking for mempool free-space management
     bool segmented_rpcmem = false;
+    bool rpc_mapping_poisoned = false;
     std::map<uint32_t, ggmlhexagon_rpc_segment> rpc_segments;
+    std::vector<uint32_t> pending_rpc_segments;
 
     // FastRPC call statistics
     uint64_t rpc_batch_call_count;              // total ggml_htp_execute_batch calls
@@ -2096,15 +2102,121 @@ static bool ggmlhexagon_is_mapped_ptr(const ggml_backend_hexagon_context * ctx, 
     return ggmlhexagon_segment_lookup(ctx, ptr, 1, nullptr, nullptr);
 }
 
-static void ggmlhexagon_deinit_rpcmempool(ggml_backend_hexagon_context * ctx) {
-    for (const auto & kv : ctx->rpc_segments) {
-        const auto & seg = kv.second;
-        fastrpc_munmap(ctx->domain_id, seg.fd, seg.base, seg.size);
+static bool ggmlhexagon_rpc_segment_release(ggml_backend_hexagon_context * ctx, uint32_t slot) {
+    auto it = ctx->rpc_segments.find(slot);
+    if (it == ctx->rpc_segments.end()) return false;
+    auto & seg = it->second;
+    if (seg.registered && ctx->ggmlop_handle) {
+        int err = ggml_htp_unregister_rpcmem_segment(ctx->ggmlop_handle, slot);
+        if (err != AEE_SUCCESS) {
+            GGMLHEXAGON_LOG_ERROR("[RPC-SEG] unregister failed slot=%u err=0x%x; mapping retained", slot, err);
+            ctx->rpc_mapping_poisoned = true;
+            return false;
+        }
+        seg.registered = false;
+        ctx->dsp_need_weight_inval_reset = true;
+    }
+    int err = fastrpc_munmap(ctx->domain_id, seg.fd, seg.base, seg.size);
+    if (err != 0) {
+        GGMLHEXAGON_LOG_ERROR("[RPC-SEG] unmap failed slot=%u err=0x%x; allocation retained", slot, err);
+        ctx->rpc_mapping_poisoned = true;
+        return false;
+    }
+    if (seg.accounted) {
         ggml_mem_account_mapping_change(seg.base, -1);
         ggml_mem_account_pool_destroy(seg.base);
-        rpcmem_free(seg.base);
     }
-    ctx->rpc_segments.clear();
+    rpcmem_free(seg.base);
+    ctx->rpc_segments.erase(it);
+    return true;
+}
+
+static uint32_t ggmlhexagon_rpc_segment_allocate(ggml_backend_hexagon_context * ctx, size_t size, bool reserved) {
+    if (ctx->rpc_mapping_poisoned || size > 1024ull * SIZE_IN_MB) return 0;
+    const size_t aligned = (std::max<size_t>(size, 1) + 4095) & ~(size_t)4095;
+    if (aligned > SIZE_MAX - 4096) return 0;
+    size_t map_size = aligned + 4096;
+    if (ctx->has_extended_map && g_hexagon_appcfg.rpc_mmap_mode == 0) {
+        const size_t align = 2ull * SIZE_IN_MB;
+        map_size = (map_size + align - 1) & ~(align - 1);
+    }
+    uint32_t slot = 0;
+    for (uint32_t s = 1; s < DSP_RPCMEM_MAX_SEGMENTS; s++) {
+        if (!ctx->rpc_segments.count(s)) { slot = s; break; }
+    }
+    if (!slot) {
+        GGMLHEXAGON_LOG_ERROR("[RPC-SEG] segment table full");
+        return 0;
+    }
+    void * base = rpcmem_alloc2(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, map_size);
+    if (!base) {
+        GGMLHEXAGON_LOG_ERROR("[RPC-SEG] allocation failed size=%zu", map_size);
+        return 0;
+    }
+    int fd = rpcmem_to_fd(base);
+    const auto flags = g_hexagon_appcfg.rpc_mmap_mode == 1 ? FASTRPC_MAP_FD :
+                       ctx->has_extended_map ? FASTRPC_MAP_FD_DELAYED_EXTENDED : FASTRPC_MAP_FD_DELAYED;
+    int err = fd < 0 ? -1 : fastrpc_mmap(ctx->domain_id, fd, base, 0, map_size, flags);
+    if (err != 0) {
+        GGMLHEXAGON_LOG_ERROR("[RPC-SEG] fastrpc_mmap failed slot=%u err=0x%x", slot, err);
+        rpcmem_free(base);
+        return 0;
+    }
+    err = ggml_htp_register_rpcmem_segment(ctx->ggmlop_handle, slot, (uint32_t)fd,
+                                            (uint32_t)map_size, (uint32_t)(map_size >> 32));
+    if (err != AEE_SUCCESS) {
+        GGMLHEXAGON_LOG_ERROR("[RPC-SEG] DSP registration failed slot=%u err=0x%x", slot, err);
+        int unmap_err = fastrpc_munmap(ctx->domain_id, fd, base, map_size);
+        if (unmap_err != 0) {
+            ctx->rpc_segments[slot] = {base, map_size, fd, size, false, false, false};
+            ctx->rpc_mapping_poisoned = true;
+            GGMLHEXAGON_LOG_ERROR("[RPC-SEG] failed to unwind slot=%u err=0x%x; mapping retained", slot, unmap_err);
+        } else {
+            rpcmem_free(base);
+        }
+        return 0;
+    }
+    ctx->rpc_segments[slot] = {base, map_size, fd, size, reserved, true, true};
+    ggml_mem_account_pool_create(base, "HTP_RPCMEM_SEGMENT", map_size);
+    ggml_mem_account_mapping_change(base, +1);
+    GGMLHEXAGON_LOG_ALWAYS("[RPC-SEG] mapped slot=%u size=%.2f MiB requested=%zu reserved=%d",
+                            slot, (double)map_size / SIZE_IN_MB, size, (int)reserved);
+    return slot;
+}
+
+static bool ggmlhexagon_rpc_segment_reserve(ggml_backend_hexagon_context * ctx,
+                                             const size_t * sizes, size_t count) {
+    if (!ctx || !ctx->segmented_rpcmem || ctx->rpc_mapping_poisoned || (!sizes && count)) return false;
+    std::vector<uint32_t> staged;
+    for (size_t i = 0; i < count; i++) {
+        uint32_t slot = ggmlhexagon_rpc_segment_allocate(ctx, sizes[i], true);
+        if (!slot) {
+            for (auto rit = staged.rbegin(); rit != staged.rend(); ++rit) {
+                if (!ggmlhexagon_rpc_segment_release(ctx, *rit)) break;
+            }
+            return false;
+        }
+        staged.push_back(slot);
+    }
+    ctx->pending_rpc_segments.insert(ctx->pending_rpc_segments.end(), staged.begin(), staged.end());
+    return true;
+}
+
+static bool ggmlhexagon_rpc_segment_rollback_pending(ggml_backend_hexagon_context * ctx) {
+    if (!ctx || !ctx->segmented_rpcmem) return false;
+    bool ok = true;
+    for (auto it = ctx->pending_rpc_segments.rbegin(); it != ctx->pending_rpc_segments.rend(); ++it) {
+        if (!ggmlhexagon_rpc_segment_release(ctx, *it)) ok = false;
+    }
+    ctx->pending_rpc_segments.clear();
+    return ok;
+}
+
+static void ggmlhexagon_deinit_rpcmempool(ggml_backend_hexagon_context * ctx) {
+    std::vector<uint32_t> slots;
+    for (const auto & kv : ctx->rpc_segments) slots.push_back(kv.first);
+    for (uint32_t slot : slots) ggmlhexagon_rpc_segment_release(ctx, slot);
+    ctx->pending_rpc_segments.clear();
     if (ctx->rpc_mempool) {
         ggmlhexagon_rpcmem_fd_snapshot(ctx, "before_rpcmem_free");
         ggmlhexagon_mem_snapshot("before_rpcmem_free:HTP" + std::to_string(ctx->device));
@@ -6968,20 +7080,7 @@ struct ggml_backend_hexagon_buffer_context {
                     }
                 }
             } else if (backend_ctx && segment_id) {
-                auto it = backend_ctx->rpc_segments.find(segment_id);
-                if (it != backend_ctx->rpc_segments.end()) {
-                    const auto seg = it->second;
-                    const int err = backend_ctx->ggmlop_handle ?
-                        ggml_htp_unregister_rpcmem_segment(backend_ctx->ggmlop_handle, segment_id) : AEE_EFAILED;
-                    if (err != AEE_SUCCESS)
-                        GGMLHEXAGON_LOG_WARN("[RPC-SEG] unregister failed: slot=%u err=0x%x", segment_id, err);
-                    backend_ctx->dsp_need_weight_inval_reset = true;
-                    backend_ctx->rpc_segments.erase(it);
-                    fastrpc_munmap(backend_ctx->domain_id, seg.fd, seg.base, seg.size);
-                    ggml_mem_account_mapping_change(seg.base, -1);
-                    ggml_mem_account_pool_destroy(seg.base);
-                    rpcmem_free(seg.base);
-                }
+                ggmlhexagon_rpc_segment_release(backend_ctx, segment_id);
             }
         }
     }
@@ -7423,60 +7522,29 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
     buffer_ctx->is_mempool_buffer = true;
 
     if (ctx->segmented_rpcmem) {
-        if (size > 1024ull * SIZE_IN_MB) {
-            delete buffer_ctx;
-            return nullptr;
-        }
-        size_t map_size = ((std::max<size_t>(size, 1) + 4095) & ~(size_t)4095) + 4096;
-        if (ctx->has_extended_map && g_hexagon_appcfg.rpc_mmap_mode == 0) {
-            const size_t align = 2ull * SIZE_IN_MB;
-            map_size = (map_size + align - 1) & ~(align - 1);
-        }
         uint32_t slot = 0;
-        for (uint32_t s = 1; s < DSP_RPCMEM_MAX_SEGMENTS; s++) {
-            if (ctx->rpc_segments.count(s) == 0) { slot = s; break; }
+        for (auto it = ctx->pending_rpc_segments.begin(); it != ctx->pending_rpc_segments.end(); ++it) {
+            auto sit = ctx->rpc_segments.find(*it);
+            if (sit != ctx->rpc_segments.end() && sit->second.reserved && sit->second.requested_size == size) {
+                slot = *it;
+                sit->second.reserved = false;
+                ctx->pending_rpc_segments.erase(it);
+                break;
+            }
         }
+        if (!slot) slot = ggmlhexagon_rpc_segment_allocate(ctx, size, false);
         if (!slot) {
-            GGMLHEXAGON_LOG_ERROR("[RPC-SEG] segment table full");
             delete buffer_ctx;
             return nullptr;
         }
-        void * base = rpcmem_alloc2(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, map_size);
-        if (!base) {
-            GGMLHEXAGON_LOG_ERROR("[RPC-SEG] allocation failed size=%zu", map_size);
-            delete buffer_ctx;
-            return nullptr;
-        }
-        int fd = rpcmem_to_fd(base);
-        const auto flags = g_hexagon_appcfg.rpc_mmap_mode == 1 ? FASTRPC_MAP_FD :
-                           ctx->has_extended_map ? FASTRPC_MAP_FD_DELAYED_EXTENDED : FASTRPC_MAP_FD_DELAYED;
-        int err = fd < 0 ? -1 : fastrpc_mmap(ctx->domain_id, fd, base, 0, map_size, flags);
-        if (err != 0) {
-            GGMLHEXAGON_LOG_ERROR("[RPC-SEG] fastrpc_mmap failed slot=%u err=0x%x", slot, err);
-            rpcmem_free(base);
-            delete buffer_ctx;
-            return nullptr;
-        }
-        err = ggml_htp_register_rpcmem_segment(ctx->ggmlop_handle, slot, (uint32_t)fd,
-                                                (uint32_t)map_size, (uint32_t)(map_size >> 32));
-        if (err != AEE_SUCCESS) {
-            GGMLHEXAGON_LOG_ERROR("[RPC-SEG] DSP registration failed slot=%u err=0x%x", slot, err);
-            fastrpc_munmap(ctx->domain_id, fd, base, map_size);
-            rpcmem_free(base);
-            delete buffer_ctx;
-            return nullptr;
-        }
-        ctx->rpc_segments[slot] = {base, map_size, fd};
-        ggml_mem_account_pool_create(base, "HTP_RPCMEM_SEGMENT", map_size);
-        ggml_mem_account_mapping_change(base, +1);
-        buffer_ctx->buffer = base;
-        buffer_ctx->buffer_size = map_size;
+        const auto & seg = ctx->rpc_segments.at(slot);
+        buffer_ctx->buffer = seg.base;
+        buffer_ctx->buffer_size = seg.size;
         buffer_ctx->is_mempool_buffer = false;
         buffer_ctx->segment_id = slot;
-        GGMLHEXAGON_LOG_ALWAYS("[RPC-SEG] mapped slot=%u size=%.2f MiB fd=%d", slot, (double)map_size / SIZE_IN_MB, fd);
         if (large_alloc) ggmlhexagon_mem_snapshot("after_large_htp_alloc:" + alloc_stage);
         ggml_backend_buffer_t result = ggml_backend_buffer_init(buft, ggml_backend_hexagon_buffer_interface, buffer_ctx, size);
-        ggml_mem_account_buffer_attach(result, base, 0, map_size);
+        ggml_mem_account_buffer_attach(result, seg.base, 0, seg.size);
         return result;
     }
 
@@ -10063,12 +10131,28 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
     return true;
 }
 
+static bool ggml_backend_hexagon_reserve_segments(ggml_backend_dev_t dev, const size_t * sizes, size_t count) {
+    auto * ctx = static_cast<ggml_backend_hexagon_context *>(dev ? dev->context : nullptr);
+    return ggmlhexagon_rpc_segment_reserve(ctx, sizes, count);
+}
+
+static bool ggml_backend_hexagon_rollback_segments(ggml_backend_dev_t dev) {
+    auto * ctx = static_cast<ggml_backend_hexagon_context *>(dev ? dev->context : nullptr);
+    return ggmlhexagon_rpc_segment_rollback_pending(ctx);
+}
+
 static void * ggml_backend_hexagon_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
 
     if (nullptr == name)
         return nullptr;
 
+    if (0 == strcmp(name, "ggml_backend_hexagon_reserve_segments")) {
+        return (void *)ggml_backend_hexagon_reserve_segments;
+    }
+    if (0 == strcmp(name, "ggml_backend_hexagon_rollback_segments")) {
+        return (void *)ggml_backend_hexagon_rollback_segments;
+    }
     if (0 == strcmp(name, "ggml_backend_set_n_threads")) {
         return (void *)ggml_backend_hexagon_set_n_threads;
     }
