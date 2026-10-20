@@ -7522,6 +7522,11 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
     buffer_ctx->is_mempool_buffer = true;
 
     if (ctx->segmented_rpcmem) {
+        if (ctx->rpc_mapping_poisoned) {
+            GGMLHEXAGON_LOG_ERROR("[RPC-SEG] refusing allocation after a mapping teardown failure");
+            delete buffer_ctx;
+            return nullptr;
+        }
         uint32_t slot = 0;
         for (auto it = ctx->pending_rpc_segments.begin(); it != ctx->pending_rpc_segments.end(); ++it) {
             auto sit = ctx->rpc_segments.find(*it);
@@ -7733,6 +7738,8 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer_n(
                 ggml_status st = t->view_src ? ggml_backend_view_init(t) : ggml_tallocr_alloc(&alloc, t);
                 if (st != GGML_STATUS_SUCCESS) {
                     ggml_backend_buffer_free(b);
+                    for (auto * prev : chunks) ggml_backend_buffer_free(prev);
+                    chunks.clear();
                     return false;
                 }
             }
