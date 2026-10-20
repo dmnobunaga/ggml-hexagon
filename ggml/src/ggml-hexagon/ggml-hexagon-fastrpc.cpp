@@ -7773,6 +7773,7 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer_n(
             chunk_mb = (size_t) value;
         }
         const size_t max_chunk = chunk_mb * SIZE_IN_MB;
+        const size_t hard_limit = 1024ull * SIZE_IN_MB;
         std::vector<ggml_backend_buffer_t> chunks;
         size_t chunk_bytes = 0;
         int first = 0;
@@ -7799,17 +7800,25 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer_n(
             ggml_tensor * t = tensors[i];
             if (t->data || t->view_src) continue;
             size_t bytes = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
-            if (bytes > max_chunk) {
+            if (bytes > hard_limit) {
+                GGMLHEXAGON_LOG_ERROR("[RPC-SEG] tensor %s requires %.2f MiB, above 1024 MiB hardware segment limit",
+                                      t->name, (double) bytes / SIZE_IN_MB);
                 for (auto * b : chunks) ggml_backend_buffer_free(b);
                 return nullptr;
             }
-            if (chunk_bytes && bytes > max_chunk - chunk_bytes) {
+            // A single tensor cannot be split without changing GGML tensor storage.
+            // Let it occupy one standalone segment above the soft target cap.
+            if (chunk_bytes && (chunk_bytes > max_chunk || bytes > max_chunk - chunk_bytes)) {
                 if (!flush_chunk(i)) {
                     for (auto * b : chunks) ggml_backend_buffer_free(b);
                     return nullptr;
                 }
                 first = i;
                 chunk_bytes = 0;
+            }
+            if (bytes > max_chunk) {
+                GGMLHEXAGON_LOG_ALWAYS("[RPC-SEG] standalone tensor %s %.2f MiB exceeds soft target %zu MiB",
+                                       t->name, (double) bytes / SIZE_IN_MB, chunk_mb);
             }
             chunk_bytes += bytes;
         }
