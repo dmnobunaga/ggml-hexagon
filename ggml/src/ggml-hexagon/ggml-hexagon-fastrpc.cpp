@@ -201,6 +201,7 @@ struct ggml_backend_hexagon_context {
     std::vector<ion_pool_region> ion_regions;   // region tracking for mempool free-space management
     bool segmented_rpcmem = false;
     bool rpc_mapping_poisoned = false;
+    bool rpc_reservation_strict = false;
     std::map<uint32_t, ggmlhexagon_rpc_segment> rpc_segments;
     std::vector<uint32_t> pending_rpc_segments;
 
@@ -2199,6 +2200,7 @@ static bool ggmlhexagon_rpc_segment_reserve(ggml_backend_hexagon_context * ctx,
         staged.push_back(slot);
     }
     ctx->pending_rpc_segments.insert(ctx->pending_rpc_segments.end(), staged.begin(), staged.end());
+    if (!staged.empty()) ctx->rpc_reservation_strict = true;
     return true;
 }
 
@@ -2213,6 +2215,7 @@ static bool ggmlhexagon_rpc_segment_rollback_pending(ggml_backend_hexagon_contex
         }
     }
     ctx->pending_rpc_segments.assign(retained.rbegin(), retained.rend());
+    ctx->rpc_reservation_strict = !ctx->pending_rpc_segments.empty();
     return ok;
 }
 
@@ -2221,6 +2224,7 @@ static void ggmlhexagon_deinit_rpc_segments(ggml_backend_hexagon_context * ctx) 
     for (const auto & kv : ctx->rpc_segments) slots.push_back(kv.first);
     for (uint32_t slot : slots) ggmlhexagon_rpc_segment_release(ctx, slot);
     ctx->pending_rpc_segments.clear();
+    ctx->rpc_reservation_strict = false;
 }
 
 static void ggmlhexagon_deinit_rpcmempool(ggml_backend_hexagon_context * ctx) {
@@ -7544,8 +7548,15 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
                 slot = *it;
                 sit->second.reserved = false;
                 ctx->pending_rpc_segments.erase(it);
+                if (ctx->pending_rpc_segments.empty()) ctx->rpc_reservation_strict = false;
                 break;
             }
+        }
+        if (!slot && ctx->rpc_reservation_strict) {
+            GGMLHEXAGON_LOG_ERROR("[HTP-OFFLOAD] reserved size mismatch requested=%zu pending=%zu",
+                                  size, ctx->pending_rpc_segments.size());
+            delete buffer_ctx;
+            return nullptr;
         }
         if (!slot) slot = ggmlhexagon_rpc_segment_allocate(ctx, size, false);
         if (!slot) {
