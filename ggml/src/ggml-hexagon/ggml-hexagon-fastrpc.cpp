@@ -7547,15 +7547,21 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(ggml_
             return nullptr;
         }
         uint32_t slot = 0;
+        auto best = ctx->pending_rpc_segments.end();
+        size_t best_size = SIZE_MAX;
         for (auto it = ctx->pending_rpc_segments.begin(); it != ctx->pending_rpc_segments.end(); ++it) {
             auto sit = ctx->rpc_segments.find(*it);
-            if (sit != ctx->rpc_segments.end() && sit->second.reserved && sit->second.requested_size >= size) {
-                slot = *it;
-                sit->second.reserved = false;
-                ctx->pending_rpc_segments.erase(it);
-                if (ctx->pending_rpc_segments.empty()) ctx->rpc_reservation_strict = false;
-                break;
+            if (sit != ctx->rpc_segments.end() && sit->second.reserved &&
+                sit->second.requested_size >= size && sit->second.requested_size < best_size) {
+                best = it;
+                best_size = sit->second.requested_size;
             }
+        }
+        if (best != ctx->pending_rpc_segments.end()) {
+            slot = *best;
+            ctx->rpc_segments.at(slot).reserved = false;
+            ctx->pending_rpc_segments.erase(best);
+            if (ctx->pending_rpc_segments.empty()) ctx->rpc_reservation_strict = false;
         }
         if (!slot && ctx->rpc_reservation_strict) {
             GGMLHEXAGON_LOG_ERROR("[HTP-OFFLOAD] reserved size mismatch requested=%zu pending=%zu",
@@ -10197,6 +10203,7 @@ static bool ggml_backend_hexagon_pending_can_fit(ggml_backend_dev_t dev,
                                                   const size_t * sizes, size_t count) {
     auto * ctx = static_cast<ggml_backend_hexagon_context *>(dev ? dev->context : nullptr);
     if (!ctx || !ctx->segmented_rpcmem || ctx->rpc_mapping_poisoned || (!sizes && count)) return false;
+    if (!count) return true;
     std::vector<size_t> capacity;
     for (uint32_t slot : ctx->pending_rpc_segments) {
         auto it = ctx->rpc_segments.find(slot);
@@ -10206,7 +10213,7 @@ static bool ggml_backend_hexagon_pending_can_fit(ggml_backend_dev_t dev,
     }
     std::sort(capacity.begin(), capacity.end());
     std::vector<size_t> requests(sizes, sizes + count);
-    std::sort(requests.begin(), requests.end(), std::greater<size_t>());
+    std::sort(requests.rbegin(), requests.rend());
     for (size_t request : requests) {
         auto it = std::lower_bound(capacity.begin(), capacity.end(), request);
         if (it == capacity.end()) return false;
