@@ -475,9 +475,10 @@ static llama_model * llama_load_adaptive_htp(
     };
 
     try {
-        const size_t initial_available = llama_adaptive_htp_available_mb();
         auto initial = make_probe(params.n_gpu_layers);
-        if (!initial || !initial_available) return nullptr;
+        if (!initial) return nullptr;
+        const size_t initial_available = llama_adaptive_htp_available_mb();
+        if (!initial_available) return nullptr;
         if (initial->devices.size() != 1 || initial->devices.front().dev != htp) {
             LLAMA_LOG_ERROR("[HTP-OFFLOAD] only one active HTP device is supported\n");
             return nullptr;
@@ -487,6 +488,10 @@ static llama_model * llama_load_adaptive_htp(
         int upper = requested;
 
         if (!llama_adaptive_htp_ram_budget(*initial, requested, initial_available)) {
+            if (requested == 0) {
+                LLAMA_LOG_ERROR("[HTP-OFFLOAD] CPU-only model also exceeds RAM budget\n");
+                return nullptr;
+            }
             int lo = 0;
             int hi = requested - 1;
             while (lo < hi) {
@@ -559,8 +564,8 @@ static llama_model * llama_load_adaptive_htp(
         LLAMA_LOG_INFO("[HTP-OFFLOAD] requested=%d effective_ngl=%d\n", requested, lo);
         const auto [status, loaded] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud,
                                                        path_model, splits, file, params);
-        if (!rollback(htp)) {
-            LLAMA_LOG_ERROR("[HTP-OFFLOAD] failed to release unused reservations\n");
+        if (!rollback(htp) || !healthy(htp)) {
+            LLAMA_LOG_ERROR("[HTP-OFFLOAD] failed to release unused reservations or HTP mapping is tainted\n");
             if (loaded) llama_model_free(loaded);
             return nullptr;
         }
