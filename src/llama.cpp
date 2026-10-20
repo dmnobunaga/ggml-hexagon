@@ -424,9 +424,11 @@ static bool llama_adaptive_htp_ram_budget(const llama_model & probe, int candida
         reserve_mb = (size_t) parsed;
     }
     const size_t required_mb = model_bytes / MiB + (model_bytes % MiB != 0) + reserve_mb;
-    LLAMA_LOG_INFO("[HTP-OFFLOAD] candidate=%d model=%.1f MiB reserve=%zu MiB available=%zu MiB\n",
-                   candidate, double(model_bytes) / MiB, reserve_mb, available_mb);
-    return available_mb && required_mb <= available_mb;
+    const bool fits = available_mb && required_mb <= available_mb;
+    LLAMA_LOG_WARN("[HTP-OFFLOAD] RAM preflight: ngl=%d model=%.1f MiB reserve=%zu MiB required=%zu MiB available=%zu MiB result=%s\n",
+                   candidate, double(model_bytes) / MiB, reserve_mb, required_mb, available_mb,
+                   fits ? "PASS" : "REJECT");
+    return fits;
 }
 
 static llama_model * llama_load_adaptive_htp(
@@ -511,7 +513,7 @@ static llama_model * llama_load_adaptive_htp(
             initial.reset();
             upper_probe = make_probe(upper);
             if (!upper_probe || !llama_adaptive_htp_ram_budget(*upper_probe, upper, initial_available)) {
-                LLAMA_LOG_ERROR("[HTP-OFFLOAD] no model configuration fits system RAM budget\n");
+                LLAMA_LOG_ERROR("[HTP-OFFLOAD] RAM preflight rejected every candidate. Lowering ngl cannot make the model safe with the current MemAvailable and reserve. No DSP weights were allocated.\n");
                 return nullptr;
             }
         }
