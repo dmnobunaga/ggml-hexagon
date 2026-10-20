@@ -646,6 +646,9 @@ static llama_model * llama_load_adaptive_htp(
         std::fprintf(stderr, "[HTP-OFFLOAD]   segment_chunk_cap        = %s MiB (soft target; standalone tensors may be larger)\n",
                      std::getenv("GGML_HEXAGON_SEGMENT_MB") ? std::getenv("GGML_HEXAGON_SEGMENT_MB") : "1024");
         std::fprintf(stderr, "[HTP-OFFLOAD]   adaptive_strategy         = %s\n", candidate_retry ? "candidate-retry" : "requested-prefix");
+        std::fprintf(stderr, "[HTP-OFFLOAD]   dsp_va_window            = %s MiB (%s)\n",
+                     std::getenv("GGML_HEXAGON_DSP_VA_WINDOW_MB") ? std::getenv("GGML_HEXAGON_DSP_VA_WINDOW_MB") : "0",
+                     std::getenv("GGML_HEXAGON_DSP_VA_WINDOW_MB") ? "experimental" : "disabled");
         std::fprintf(stderr, "[HTP-OFFLOAD]   effective_ngl            = %d\n", lo);
         std::fprintf(stderr, "[HTP-OFFLOAD]   registered_prefix        = %zu/%zu segments\n", mapped, requested_chunks.size());
         std::fprintf(stderr, "[HTP-OFFLOAD]   dsp_weight_segments      = %zu\n", segment_count);
