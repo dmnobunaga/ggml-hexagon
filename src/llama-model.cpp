@@ -2027,7 +2027,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     for (const auto & item : planned_htp) {
                         auto * dev = item.first;
                         auto * reg = ggml_backend_dev_backend_reg(dev);
-                        auto * proc = reinterpret_cast<reserved_fn>(ggml_backend_reg_get_proc_address(
+                        reserved_fn proc = reinterpret_cast<reserved_fn>(ggml_backend_reg_get_proc_address(
                             reg, "ggml_backend_hexagon_pending_reserved_bytes"));
                         if (!proc) continue;
                         size_t bytes = proc(dev);
