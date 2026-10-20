@@ -846,6 +846,8 @@ struct llama_model {
         std::vector<size_t> chunks;
     };
     std::vector<htp_weight_plan> htp_weight_plans;
+    size_t htp_cpu_mmap_weight_bytes = 0;
+    size_t htp_cpu_anon_weight_bytes = 0;
 
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
