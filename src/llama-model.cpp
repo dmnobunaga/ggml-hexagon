@@ -2134,16 +2134,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     chunk_mb = (size_t) value;
                 }
                 const size_t max_chunk = chunk_mb * 1024ull * 1024;
+                const size_t hard_limit = 1024ull * 1024 * 1024;
                 llama_model::htp_weight_plan plan;
                 plan.device = dev;
                 size_t chunk_bytes = 0;
                 for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
                     if (t->data || t->view_src) continue;
                     const size_t bytes = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
-                    if (bytes > max_chunk) {
-                        throw std::runtime_error(format("[HTP-OFFLOAD] tensor %s exceeds segment limit", t->name));
+                    if (bytes > hard_limit) {
+                        throw std::runtime_error(format("[HTP-OFFLOAD] tensor %s exceeds 1024 MiB hardware segment limit", t->name));
                     }
-                    if (chunk_bytes && bytes > max_chunk - chunk_bytes) {
+                    // The target chunk size is soft: one indivisible tensor may exceed it.
+                    // Place that tensor alone; keep the 1024 MiB hardware cap hard.
+                    if (chunk_bytes && (chunk_bytes > max_chunk || bytes > max_chunk - chunk_bytes)) {
                         plan.chunks.push_back(chunk_bytes);
                         chunk_bytes = 0;
                     }
