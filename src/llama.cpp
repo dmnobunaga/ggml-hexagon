@@ -460,12 +460,14 @@ static llama_model * llama_load_adaptive_htp(
     using health_fn = bool (*)(ggml_backend_dev_t);
     using rollback_fn = bool (*)(ggml_backend_dev_t);
     using segment_stats_fn = void (*)(ggml_backend_dev_t, size_t *, size_t *, size_t *, size_t *);
+    using segment_at_fn = bool (*)(ggml_backend_dev_t, size_t, uint32_t *, size_t *, size_t *);
     ggml_backend_dev_t htp = nullptr;
     reserve_prefix_fn reserve_prefix = nullptr;
     can_fit_fn can_fit = nullptr;
     health_fn healthy = nullptr;
     rollback_fn rollback = nullptr;
     segment_stats_fn segment_stats = nullptr;
+    segment_at_fn segment_at = nullptr;
 
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         auto * dev = ggml_backend_dev_get(i);
@@ -481,8 +483,9 @@ static llama_model * llama_load_adaptive_htp(
         healthy = reinterpret_cast<health_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_mapping_healthy"));
         rollback = reinterpret_cast<rollback_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_rollback_segments"));
         segment_stats = reinterpret_cast<segment_stats_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_segment_stats"));
+        segment_at = reinterpret_cast<segment_at_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_segment_at"));
     }
-    if (!htp || !reserve_prefix || !can_fit || !healthy || !rollback || !segment_stats) {
+    if (!htp || !reserve_prefix || !can_fit || !healthy || !rollback || !segment_stats || !segment_at) {
         LLAMA_LOG_ERROR("[HTP-OFFLOAD] transactional HTP reservation interface unavailable\n");
         return nullptr;
     }
@@ -588,6 +591,14 @@ static llama_model * llama_load_adaptive_htp(
         std::fprintf(stderr, "[HTP-OFFLOAD]   dsp_weight_mapped        = %.2f MiB\n", (double) segment_mapped_bytes / mib);
         std::fprintf(stderr, "[HTP-OFFLOAD]   dsp_weight_payload       = %.2f MiB\n", (double) segment_payload_bytes / mib);
         std::fprintf(stderr, "[HTP-OFFLOAD]   dsp_workspace            = %.2f MiB\n", (double) workspace_bytes / mib);
+        for (size_t i = 0; i < segment_count; i++) {
+            uint32_t slot = 0;
+            size_t bytes = 0;
+            size_t payload = 0;
+            if (!segment_at(htp, i, &slot, &bytes, &payload)) break;
+            std::fprintf(stderr, "[HTP-OFFLOAD]   dsp_segment_slot_%-3u   = %.2f MiB mapped (%.2f MiB payload)\n",
+                         slot, (double) bytes / mib, (double) payload / mib);
+        }
         std::fprintf(stderr, "[HTP-OFFLOAD]   cpu_weight_mmap          = %.2f MiB (file-backed weight bytes, not RSS)\n",
                      (double) loaded->htp_cpu_mmap_weight_bytes / mib);
         std::fprintf(stderr, "[HTP-OFFLOAD]   cpu_weight_anon          = %.2f MiB (allocated weight bytes, not RSS)\n",
