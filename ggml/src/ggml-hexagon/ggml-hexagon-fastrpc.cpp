@@ -2256,8 +2256,12 @@ static void ggmlhexagon_deinit_cdsp(ggml_backend_hexagon_context * ctx) {
         }
         if (hexagon_error == AEE_SUCCESS) ctx->ggmlop_handle = 0;
     }
-    if (ctx->ggmlop_handle == 0) ggmlhexagon_deinit_rpcmempool(ctx);
-    else GGMLHEXAGON_LOG_ERROR("[RPC-SEG] DSP close failed; retaining unresolved mappings");
+    if (ctx->ggmlop_handle == 0) {
+        ggmlhexagon_deinit_rpcmempool(ctx);
+    } else {
+        GGMLHEXAGON_LOG_ERROR("[RPC-SEG] DSP close failed; retained_segments=%zu workspace=%zu MiB (cleanup deferred to process exit)",
+                              ctx->rpc_segments.size(), ctx->rpc_mempool_len / SIZE_IN_MB);
+    }
     //Probe before domain_id is invalidated so AP-side domain queries still work
     if (ctx->domain_id >= 0) {
         ggmlhexagon_probe_dspinfo(ctx);
