@@ -10159,6 +10159,20 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
     return true;
 }
 
+static size_t ggml_backend_hexagon_pending_reserved_bytes(ggml_backend_dev_t dev) {
+    auto * ctx = static_cast<ggml_backend_hexagon_context *>(dev ? dev->context : nullptr);
+    if (!ctx || !ctx->segmented_rpcmem) return 0;
+    size_t total = 0;
+    for (uint32_t slot : ctx->pending_rpc_segments) {
+        auto it = ctx->rpc_segments.find(slot);
+        if (it != ctx->rpc_segments.end()) {
+            if (it->second.size > SIZE_MAX - total) return SIZE_MAX;
+            total += it->second.size;
+        }
+    }
+    return total;
+}
+
 static bool ggml_backend_hexagon_reserve_segments(ggml_backend_dev_t dev, const size_t * sizes, size_t count) {
     auto * ctx = static_cast<ggml_backend_hexagon_context *>(dev ? dev->context : nullptr);
     return ggmlhexagon_rpc_segment_reserve(ctx, sizes, count);
@@ -10175,6 +10189,9 @@ static void * ggml_backend_hexagon_reg_get_proc_address(ggml_backend_reg_t reg, 
     if (nullptr == name)
         return nullptr;
 
+    if (0 == strcmp(name, "ggml_backend_hexagon_pending_reserved_bytes")) {
+        return (void *)ggml_backend_hexagon_pending_reserved_bytes;
+    }
     if (0 == strcmp(name, "ggml_backend_hexagon_reserve_segments")) {
         return (void *)ggml_backend_hexagon_reserve_segments;
     }
