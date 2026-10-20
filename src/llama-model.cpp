@@ -2019,8 +2019,33 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
             const size_t available_mb = (size_t) available_kib / 1024;
             const size_t planned_cpu_mb = planned_cpu / MiB + (planned_cpu % MiB != 0);
+            size_t already_reserved_htp = 0;
+            if (segmented_rpcmem) {
+                const char * adaptive = std::getenv("GGML_HEXAGON_ADAPTIVE_OFFLOAD");
+                if (adaptive && std::strcmp(adaptive, "1") == 0) {
+                    using reserved_fn = size_t (*)(ggml_backend_dev_t);
+                    for (const auto & item : planned_htp) {
+                        auto * dev = item.first;
+                        auto * reg = ggml_backend_dev_backend_reg(dev);
+                        auto * proc = reinterpret_cast<reserved_fn>(ggml_backend_reg_get_proc_address(
+                            reg, "ggml_backend_hexagon_pending_reserved_bytes"));
+                        if (!proc) continue;
+                        size_t bytes = proc(dev);
+                        if (bytes > SIZE_MAX - already_reserved_htp) {
+                            throw std::runtime_error("[MEM-GUARD] reserved HTP size overflow");
+                        }
+                        already_reserved_htp += bytes;
+                    }
+                }
+            }
+            const size_t remaining_htp_bytes = planned_htp_bytes > already_reserved_htp
+                                               ? planned_htp_bytes - already_reserved_htp : 0;
             const size_t planned_htp_mb = segmented_rpcmem
-                    ? planned_htp_bytes / MiB + (planned_htp_bytes % MiB != 0) : 0;
+                    ? remaining_htp_bytes / MiB + (remaining_htp_bytes % MiB != 0) : 0;
+            if (already_reserved_htp) {
+                LLAMA_LOG_INFO("[HTP-OFFLOAD] already reserved=%.2f MiB; HTP bytes not double-counted in RAM guard\n",
+                               (double) already_reserved_htp / MiB);
+            }
             const size_t required_mb = planned_cpu_mb + planned_htp_mb + reserve_mb;
             LLAMA_LOG_INFO("[MEM-GUARD] MemAvailable=%zu MiB planned_cpu=%zu MiB planned_htp=%zu MiB reserve=%zu MiB required=%zu MiB segmented=%d\n",
                 available_mb, planned_cpu_mb, planned_htp_mb, reserve_mb, required_mb, (int)segmented_rpcmem);
