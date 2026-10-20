@@ -491,9 +491,15 @@ static llama_model * llama_load_adaptive_htp(
 
         if (!llama_adaptive_htp_ram_budget(*initial, requested, initial_available)) {
             if (requested == 0) {
-                LLAMA_LOG_ERROR("[HTP-OFFLOAD] CPU-only model also exceeds RAM budget\n");
+                LLAMA_LOG_ERROR("[HTP-OFFLOAD] CPU-only model exceeds RAM budget; offload cannot resolve this\n");
                 return nullptr;
             }
+            auto cpu_probe = make_probe(0);
+            if (!cpu_probe || !llama_adaptive_htp_ram_budget(*cpu_probe, 0, initial_available)) {
+                LLAMA_LOG_ERROR("[HTP-OFFLOAD] CPU-only model also exceeds RAM budget. Check MemAvailable, resident RAM use, and reserve setting before testing DSP mappings.\n");
+                return nullptr;
+            }
+            cpu_probe.reset();
             int lo = 0;
             int hi = requested - 1;
             while (lo < hi) {
