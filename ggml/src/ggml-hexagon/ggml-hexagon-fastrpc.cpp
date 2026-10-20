@@ -2191,8 +2191,8 @@ static bool ggmlhexagon_rpc_segment_reserve(ggml_backend_hexagon_context * ctx,
     for (size_t i = 0; i < count; i++) {
         uint32_t slot = ggmlhexagon_rpc_segment_allocate(ctx, sizes[i], true);
         if (!slot) {
-            for (auto rit = staged.rbegin(); rit != staged.rend(); ++rit) {
-                if (!ggmlhexagon_rpc_segment_release(ctx, *rit)) break;
+            for (auto it = staged.rbegin(); it != staged.rend(); ++it) {
+                ggmlhexagon_rpc_segment_release(ctx, *it);
             }
             return false;
         }
@@ -2205,10 +2205,14 @@ static bool ggmlhexagon_rpc_segment_reserve(ggml_backend_hexagon_context * ctx,
 static bool ggmlhexagon_rpc_segment_rollback_pending(ggml_backend_hexagon_context * ctx) {
     if (!ctx || !ctx->segmented_rpcmem) return false;
     bool ok = true;
+    std::vector<uint32_t> retained;
     for (auto it = ctx->pending_rpc_segments.rbegin(); it != ctx->pending_rpc_segments.rend(); ++it) {
-        if (!ggmlhexagon_rpc_segment_release(ctx, *it)) ok = false;
+        if (!ggmlhexagon_rpc_segment_release(ctx, *it)) {
+            retained.push_back(*it);
+            ok = false;
+        }
     }
-    ctx->pending_rpc_segments.clear();
+    ctx->pending_rpc_segments.assign(retained.rbegin(), retained.rend());
     return ok;
 }
 
