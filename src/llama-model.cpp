@@ -2123,7 +2123,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (!dev || !name || !std::strstr(name, "hexagon-ion-buffer")) continue;
                 auto * ctx = ctx_ptr.get();
                 const size_t alignment = ggml_backend_buft_get_alignment(buft);
-                const size_t max_chunk = 1024ull * 1024 * 1024;
+                size_t chunk_mb = 1024;
+                if (const char * env = std::getenv("GGML_HEXAGON_SEGMENT_MB")) {
+                    char * end = nullptr;
+                    errno = 0;
+                    long value = std::strtol(env, &end, 10);
+                    if (errno || end == env || *end || value < 256 || value > 1024 || value % 64) {
+                        throw std::runtime_error("[HTP-OFFLOAD] GGML_HEXAGON_SEGMENT_MB must be a multiple of 64, range 256..1024");
+                    }
+                    chunk_mb = (size_t) value;
+                }
+                const size_t max_chunk = chunk_mb * 1024ull * 1024;
                 llama_model::htp_weight_plan plan;
                 plan.device = dev;
                 size_t chunk_bytes = 0;
