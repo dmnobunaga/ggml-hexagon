@@ -2168,7 +2168,8 @@ static uint32_t ggmlhexagon_rpc_segment_allocate(ggml_backend_hexagon_context * 
     err = ggml_htp_register_rpcmem_segment(ctx->ggmlop_handle, slot, (uint32_t)fd,
                                             (uint32_t)map_size, (uint32_t)(map_size >> 32));
     if (err != AEE_SUCCESS) {
-        GGMLHEXAGON_LOG_ERROR("[RPC-SEG] DSP registration failed slot=%u err=0x%x", slot, err);
+        GGMLHEXAGON_LOG_ERROR("[RPC-SEG] DSP registration failed slot=%u requested=%.2f MiB mapped=%.2f MiB err=0x%x",
+                              slot, (double)size / SIZE_IN_MB, (double)map_size / SIZE_IN_MB, err);
         int unmap_err = fastrpc_munmap(ctx->domain_id, fd, base, map_size);
         if (unmap_err != 0) {
             ctx->rpc_segments[slot] = {base, map_size, fd, size, false, false, false};
