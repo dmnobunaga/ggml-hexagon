@@ -393,6 +393,64 @@ static bool llama_adaptive_htp_enabled(const llama_model_params & params, const 
            !path_model.empty() && !metadata && !file;
 }
 
+struct llama_htp_stat {
+    unsigned long long kib = 0;
+    bool valid = false;
+};
+
+struct llama_htp_memory_sample {
+    llama_htp_stat mem_available;
+    llama_htp_stat swap_free;
+    llama_htp_stat rss_anon;
+    llama_htp_stat rss_file;
+    llama_htp_stat rss_shmem;
+    llama_htp_stat vm_rss;
+    llama_htp_stat vm_hwm;
+    llama_htp_stat vm_swap;
+};
+
+static llama_htp_memory_sample llama_htp_read_memory() {
+    llama_htp_memory_sample sample;
+    auto read_entry = [](const char * line, const char * key, llama_htp_stat & stat) {
+        char parsed_key[64] = {};
+        unsigned long long value = 0;
+        if (std::sscanf(line, "%63[^:]: %llu", parsed_key, &value) == 2 &&
+            std::strcmp(parsed_key, key) == 0) {
+            stat.kib = value;
+            stat.valid = true;
+        }
+    };
+    if (FILE * f = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), f)) {
+            read_entry(line, "MemAvailable", sample.mem_available);
+            read_entry(line, "SwapFree", sample.swap_free);
+        }
+        std::fclose(f);
+    }
+    if (FILE * f = std::fopen("/proc/self/status", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), f)) {
+            read_entry(line, "RssAnon", sample.rss_anon);
+            read_entry(line, "RssFile", sample.rss_file);
+            read_entry(line, "RssShmem", sample.rss_shmem);
+            read_entry(line, "VmRSS", sample.vm_rss);
+            read_entry(line, "VmHWM", sample.vm_hwm);
+            read_entry(line, "VmSwap", sample.vm_swap);
+        }
+        std::fclose(f);
+    }
+    return sample;
+}
+
+static void llama_htp_print_memory(const char * name, const llama_htp_stat & stat) {
+    if (stat.valid) {
+        std::fprintf(stderr, "[HTP-OFFLOAD]   %-24s = %.2f MiB\n", name, (double) stat.kib / 1024);
+    } else {
+        std::fprintf(stderr, "[HTP-OFFLOAD]   %-24s = n/a\n", name);
+    }
+}
+
 static llama_model * llama_load_adaptive_htp(
         gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & path_model, std::vector<std::string> & splits,
@@ -401,11 +459,13 @@ static llama_model * llama_load_adaptive_htp(
     using can_fit_fn = bool (*)(ggml_backend_dev_t, const size_t *, size_t);
     using health_fn = bool (*)(ggml_backend_dev_t);
     using rollback_fn = bool (*)(ggml_backend_dev_t);
+    using segment_stats_fn = void (*)(ggml_backend_dev_t, size_t *, size_t *, size_t *, size_t *);
     ggml_backend_dev_t htp = nullptr;
     reserve_prefix_fn reserve_prefix = nullptr;
     can_fit_fn can_fit = nullptr;
     health_fn healthy = nullptr;
     rollback_fn rollback = nullptr;
+    segment_stats_fn segment_stats = nullptr;
 
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         auto * dev = ggml_backend_dev_get(i);
@@ -420,8 +480,9 @@ static llama_model * llama_load_adaptive_htp(
         can_fit = reinterpret_cast<can_fit_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_pending_can_fit"));
         healthy = reinterpret_cast<health_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_mapping_healthy"));
         rollback = reinterpret_cast<rollback_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_rollback_segments"));
+        segment_stats = reinterpret_cast<segment_stats_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_segment_stats"));
     }
-    if (!htp || !reserve_prefix || !can_fit || !healthy || !rollback) {
+    if (!htp || !reserve_prefix || !can_fit || !healthy || !rollback || !segment_stats) {
         LLAMA_LOG_ERROR("[HTP-OFFLOAD] transactional HTP reservation interface unavailable\n");
         return nullptr;
     }
@@ -439,6 +500,8 @@ static llama_model * llama_load_adaptive_htp(
     };
 
     try {
+        const int original_ngl = params.n_gpu_layers;
+        const auto memory_start = llama_htp_read_memory();
         auto initial = make_probe(params.n_gpu_layers);
         if (!initial) return nullptr;
         if (initial->devices.size() != 1 || initial->devices.front().dev != htp) {
@@ -469,6 +532,7 @@ static llama_model * llama_load_adaptive_htp(
         }
         LLAMA_LOG_INFO("[HTP-OFFLOAD] mapped=%zu/%zu weight segments; selecting layers without remapping\n",
                        mapped, requested_chunks.size());
+        const auto memory_mapped = llama_htp_read_memory();
 
         int lo = 0;
         int hi = upper;
@@ -508,6 +572,38 @@ static llama_model * llama_load_adaptive_htp(
             if (loaded) llama_model_free(loaded);
             return nullptr;
         }
+        const auto memory_loaded = llama_htp_read_memory();
+        size_t segment_count = 0;
+        size_t segment_mapped_bytes = 0;
+        size_t segment_payload_bytes = 0;
+        size_t workspace_bytes = 0;
+        segment_stats(htp, &segment_count, &segment_mapped_bytes, &segment_payload_bytes, &workspace_bytes);
+
+        const double mib = 1024.0 * 1024.0;
+        std::fprintf(stderr, "[HTP-OFFLOAD] SUMMARY (after model weight load)\n");
+        std::fprintf(stderr, "[HTP-OFFLOAD]   requested_ngl            = %d (clamped=%d)\n", original_ngl, requested);
+        std::fprintf(stderr, "[HTP-OFFLOAD]   effective_ngl            = %d\n", lo);
+        std::fprintf(stderr, "[HTP-OFFLOAD]   registered_prefix        = %zu/%zu segments\n", mapped, requested_chunks.size());
+        std::fprintf(stderr, "[HTP-OFFLOAD]   dsp_weight_segments      = %zu\n", segment_count);
+        std::fprintf(stderr, "[HTP-OFFLOAD]   dsp_weight_mapped        = %.2f MiB\n", (double) segment_mapped_bytes / mib);
+        std::fprintf(stderr, "[HTP-OFFLOAD]   dsp_weight_payload       = %.2f MiB\n", (double) segment_payload_bytes / mib);
+        std::fprintf(stderr, "[HTP-OFFLOAD]   dsp_workspace            = %.2f MiB\n", (double) workspace_bytes / mib);
+        std::fprintf(stderr, "[HTP-OFFLOAD]   cpu_weight_mmap          = %.2f MiB (file-backed weight bytes, not RSS)\n",
+                     (double) loaded->htp_cpu_mmap_weight_bytes / mib);
+        std::fprintf(stderr, "[HTP-OFFLOAD]   cpu_weight_anon          = %.2f MiB (allocated weight bytes, not RSS)\n",
+                     (double) loaded->htp_cpu_anon_weight_bytes / mib);
+        llama_htp_print_memory("MemAvailable_start", memory_start.mem_available);
+        llama_htp_print_memory("MemAvailable_mapped", memory_mapped.mem_available);
+        llama_htp_print_memory("MemAvailable_loaded", memory_loaded.mem_available);
+        llama_htp_print_memory("SwapFree_start", memory_start.swap_free);
+        llama_htp_print_memory("SwapFree_loaded", memory_loaded.swap_free);
+        llama_htp_print_memory("RssAnon_loaded", memory_loaded.rss_anon);
+        llama_htp_print_memory("RssFile_loaded", memory_loaded.rss_file);
+        llama_htp_print_memory("RssShmem_loaded", memory_loaded.rss_shmem);
+        llama_htp_print_memory("VmRSS_loaded", memory_loaded.vm_rss);
+        llama_htp_print_memory("VmHWM_loaded", memory_loaded.vm_hwm);
+        llama_htp_print_memory("VmSwap_loaded", memory_loaded.vm_swap);
+        std::fflush(stderr);
         return loaded;
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("[HTP-OFFLOAD] %s\n", e.what());
