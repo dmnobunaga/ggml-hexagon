@@ -10175,6 +10175,21 @@ static bool ggml_backend_hexagon_comm_allreduce_tensor(void * comm_ctx_v, struct
     return true;
 }
 
+static bool ggml_backend_hexagon_segment_at(ggml_backend_dev_t dev, size_t index,
+                                            uint32_t * slot, size_t * mapped_bytes, size_t * requested_bytes) {
+    auto * ctx = static_cast<ggml_backend_hexagon_context *>(dev ? dev->context : nullptr);
+    if (!ctx || !ctx->segmented_rpcmem) return false;
+    for (const auto & [id, seg] : ctx->rpc_segments) {
+        if (!seg.registered) continue;
+        if (index-- != 0) continue;
+        if (slot) *slot = id;
+        if (mapped_bytes) *mapped_bytes = seg.size;
+        if (requested_bytes) *requested_bytes = seg.requested_size;
+        return true;
+    }
+    return false;
+}
+
 static void ggml_backend_hexagon_segment_stats(ggml_backend_dev_t dev,
                                                size_t * count, size_t * mapped_bytes,
                                                size_t * requested_bytes, size_t * workspace_bytes) {
@@ -10315,6 +10330,9 @@ static void * ggml_backend_hexagon_reg_get_proc_address(ggml_backend_reg_t reg, 
     }
     if (0 == strcmp(name, "ggml_backend_hexagon_mapping_healthy")) {
         return (void *)ggml_backend_hexagon_mapping_healthy;
+    }
+    if (0 == strcmp(name, "ggml_backend_hexagon_segment_at")) {
+        return (void *)ggml_backend_hexagon_segment_at;
     }
     if (0 == strcmp(name, "ggml_backend_hexagon_segment_stats")) {
         return (void *)ggml_backend_hexagon_segment_stats;
