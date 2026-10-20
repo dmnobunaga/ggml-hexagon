@@ -7760,7 +7760,18 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer_n(
     const size_t alignment = ggml_backend_buft_get_alignment(buft);
     auto * ctx = static_cast<ggml_backend_hexagon_context *>(buft->context);
     if (ctx->segmented_rpcmem) {
-        const size_t max_chunk = 1024ull * SIZE_IN_MB;
+        size_t chunk_mb = 1024;
+        if (const char * env = std::getenv("GGML_HEXAGON_SEGMENT_MB")) {
+            char * end = nullptr;
+            errno = 0;
+            long value = std::strtol(env, &end, 10);
+            if (errno || end == env || *end || value < 256 || value > 1024 || value % 64) {
+                GGMLHEXAGON_LOG_ERROR("[RPC-SEG] GGML_HEXAGON_SEGMENT_MB must be a multiple of 64, range 256..1024");
+                return nullptr;
+            }
+            chunk_mb = (size_t) value;
+        }
+        const size_t max_chunk = chunk_mb * SIZE_IN_MB;
         std::vector<ggml_backend_buffer_t> chunks;
         size_t chunk_bytes = 0;
         int first = 0;
