@@ -517,49 +517,107 @@ static llama_model * llama_load_adaptive_htp(
         std::unique_ptr<llama_model> upper_probe = std::move(initial);
         LLAMA_LOG_INFO("[HTP-OFFLOAD] requested=%d; DSP mapping drives effective_ngl; RAM protected by per-segment headroom\n",
                        requested);
+        const char * retry_env = std::getenv("GGML_HEXAGON_ADAPTIVE_CANDIDATE_RETRY");
+        const bool candidate_retry = retry_env && std::strcmp(retry_env, "1") == 0;
         std::vector<size_t> requested_chunks;
-        for (const auto & plan : upper_probe->htp_weight_plans) {
-            if (plan.device != htp) return nullptr;
-            requested_chunks.insert(requested_chunks.end(), plan.chunks.begin(), plan.chunks.end());
-        }
-        upper_probe.reset();
-
         size_t mapped = 0;
-        if (!requested_chunks.empty()) {
-            mapped = reserve_prefix(htp, requested_chunks.data(), requested_chunks.size());
-            if (!healthy(htp)) {
-                LLAMA_LOG_ERROR("[HTP-OFFLOAD] DSP mapping teardown failed; refusing further allocations\n");
-                rollback(htp);
-                return nullptr;
-            }
-        }
-        LLAMA_LOG_INFO("[HTP-OFFLOAD] mapped=%zu/%zu weight segments; selecting layers without remapping\n",
-                       mapped, requested_chunks.size());
-        const auto memory_mapped = llama_htp_read_memory();
-
         int lo = 0;
-        int hi = upper;
-        while (lo < hi) {
-            int mid = lo + (hi - lo + 1) / 2;
-            auto probe = make_probe(mid);
-            if (!probe) {
-                rollback(htp);
-                return nullptr;
+
+        auto collect_chunks = [&](const llama_model & probe, std::vector<size_t> & sizes) -> bool {
+            for (const auto & plan : probe.htp_weight_plans) {
+                if (plan.device != htp) return false;
+                sizes.insert(sizes.end(), plan.chunks.begin(), plan.chunks.end());
             }
-            std::vector<size_t> sizes;
-            for (const auto & plan : probe->htp_weight_plans) {
-                if (plan.device != htp) {
+            return true;
+        };
+
+        if (candidate_retry) {
+            // A prefix of the requested model's segments does not necessarily fit
+            // a smaller candidate's tensor layout. Allocate each candidate's exact plan.
+            upper_probe.reset();
+            int hi = upper;
+            std::fprintf(stderr, "[HTP-OFFLOAD] strategy=candidate-retry (transactional per-ngl DSP mappings)\n");
+            while (lo < hi) {
+                const int mid = lo + (hi - lo + 1) / 2;
+                auto probe = make_probe(mid);
+                if (!probe) {
                     rollback(htp);
                     return nullptr;
                 }
-                sizes.insert(sizes.end(), plan.chunks.begin(), plan.chunks.end());
+                std::vector<size_t> sizes;
+                if (!collect_chunks(*probe, sizes)) {
+                    rollback(htp);
+                    return nullptr;
+                }
+                probe.reset();
+                const size_t trial_mapped = sizes.empty() ? 0 : reserve_prefix(htp, sizes.data(), sizes.size());
+                const bool trial_healthy = healthy(htp);
+                // Never retain a failed candidate's layout for subsequent trials.
+                const bool released = rollback(htp);
+                if (!trial_healthy || !released || !healthy(htp)) {
+                    LLAMA_LOG_ERROR("[HTP-OFFLOAD] candidate %d: DSP rollback/registration state unsafe; aborting\n", mid);
+                    return nullptr;
+                }
+                const bool fit = trial_mapped == sizes.size();
+                std::fprintf(stderr, "[HTP-OFFLOAD] trial_ngl=%d mapped=%zu/%zu result=%s\n",
+                             mid, trial_mapped, sizes.size(), fit ? "FIT" : "REJECT");
+                if (fit) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
             }
-            if (can_fit(htp, sizes.data(), sizes.size())) {
-                lo = mid;
-            } else {
-                hi = mid - 1;
+            if (lo > 0) {
+                auto selected = make_probe(lo);
+                if (!selected || !collect_chunks(*selected, requested_chunks)) {
+                    rollback(htp);
+                    return nullptr;
+                }
+                selected.reset();
+                mapped = requested_chunks.empty() ? 0 :
+                         reserve_prefix(htp, requested_chunks.data(), requested_chunks.size());
+                if (!healthy(htp) || mapped != requested_chunks.size()) {
+                    LLAMA_LOG_ERROR("[HTP-OFFLOAD] selected candidate %d could not be remapped consistently\n", lo);
+                    rollback(htp);
+                    return nullptr;
+                }
+            }
+            std::fprintf(stderr, "[HTP-OFFLOAD] candidate-retry selected_ngl=%d mapped=%zu/%zu\n",
+                         lo, mapped, requested_chunks.size());
+        } else {
+            if (!collect_chunks(*upper_probe, requested_chunks)) return nullptr;
+            upper_probe.reset();
+            if (!requested_chunks.empty()) {
+                mapped = reserve_prefix(htp, requested_chunks.data(), requested_chunks.size());
+                if (!healthy(htp)) {
+                    LLAMA_LOG_ERROR("[HTP-OFFLOAD] DSP mapping teardown failed; refusing further allocations\n");
+                    rollback(htp);
+                    return nullptr;
+                }
+            }
+            LLAMA_LOG_INFO("[HTP-OFFLOAD] mapped=%zu/%zu weight segments; selecting layers without remapping\n",
+                           mapped, requested_chunks.size());
+            int hi = upper;
+            while (lo < hi) {
+                const int mid = lo + (hi - lo + 1) / 2;
+                auto probe = make_probe(mid);
+                if (!probe) {
+                    rollback(htp);
+                    return nullptr;
+                }
+                std::vector<size_t> sizes;
+                if (!collect_chunks(*probe, sizes)) {
+                    rollback(htp);
+                    return nullptr;
+                }
+                if (can_fit(htp, sizes.data(), sizes.size())) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
             }
         }
+        const auto memory_mapped = llama_htp_read_memory();
         params.n_gpu_layers = lo;
         if (lo == 0 && !rollback(htp)) return nullptr;
 
@@ -587,6 +645,7 @@ static llama_model * llama_load_adaptive_htp(
         std::fprintf(stderr, "[HTP-OFFLOAD]   requested_ngl            = %d (clamped=%d)\n", original_ngl, requested);
         std::fprintf(stderr, "[HTP-OFFLOAD]   segment_chunk_cap        = %s MiB (soft target; standalone tensors may be larger)\n",
                      std::getenv("GGML_HEXAGON_SEGMENT_MB") ? std::getenv("GGML_HEXAGON_SEGMENT_MB") : "1024");
+        std::fprintf(stderr, "[HTP-OFFLOAD]   adaptive_strategy         = %s\n", candidate_retry ? "candidate-retry" : "requested-prefix");
         std::fprintf(stderr, "[HTP-OFFLOAD]   effective_ngl            = %d\n", lo);
         std::fprintf(stderr, "[HTP-OFFLOAD]   registered_prefix        = %zu/%zu segments\n", mapped, requested_chunks.size());
         std::fprintf(stderr, "[HTP-OFFLOAD]   dsp_weight_segments      = %zu\n", segment_count);
