@@ -2054,6 +2054,41 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 #endif
 
+    if (ml.no_alloc) {
+        const char * adaptive_env = std::getenv("GGML_HEXAGON_ADAPTIVE_OFFLOAD");
+        const char * segmented_env = std::getenv("GGML_HEXAGON_SEGMENTED_RPCMEM");
+        if (adaptive_env && std::strcmp(adaptive_env, "1") == 0 &&
+            segmented_env && std::strcmp(segmented_env, "1") == 0) {
+            htp_weight_plans.clear();
+            for (auto & [key, ctx_ptr] : ml.ctx_map) {
+                ggml_backend_buffer_type_t buft = key.buft;
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                const char * name = ggml_backend_buft_name(buft);
+                if (!dev || !name || !std::strstr(name, "hexagon-ion-buffer")) continue;
+                auto * ctx = ctx_ptr.get();
+                const size_t alignment = ggml_backend_buft_get_alignment(buft);
+                const size_t max_chunk = 1024ull * 1024 * 1024;
+                llama_model::htp_weight_plan plan;
+                plan.device = dev;
+                size_t chunk_bytes = 0;
+                for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                    if (t->data || t->view_src) continue;
+                    const size_t bytes = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
+                    if (bytes > max_chunk) {
+                        throw std::runtime_error(format("[HTP-OFFLOAD] tensor %s exceeds segment limit", t->name));
+                    }
+                    if (chunk_bytes && bytes > max_chunk - chunk_bytes) {
+                        plan.chunks.push_back(chunk_bytes);
+                        chunk_bytes = 0;
+                    }
+                    chunk_bytes += bytes;
+                }
+                if (chunk_bytes) plan.chunks.push_back(chunk_bytes);
+                if (!plan.chunks.empty()) htp_weight_plans.push_back(std::move(plan));
+            }
+        }
+    }
+
     llama_model_mem_snapshot("before_model_buffers");
     for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
         ggml_backend_buffer_type_t buft = ctx_key.buft;
