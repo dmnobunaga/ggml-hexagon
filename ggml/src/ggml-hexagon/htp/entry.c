@@ -1935,20 +1935,46 @@ AEEResult ggml_htp_register_rpcmem(remote_handle64 h, uint32_t ion_fd, uint32_t 
     return AEE_SUCCESS;
 }
 
+static bool dsp_va_unmap_slot(struct dsp_context * ctx, uint32_t slot) {
+    if (!ctx->rpc_segments[slot].base) return true;
+#if __HVX_ARCH__ > 73
+    int err = HAP_munmap2(ctx->rpc_segments[slot].base, ctx->rpc_segments[slot].size);
+#else
+    int err = HAP_munmap(ctx->rpc_segments[slot].base, ctx->rpc_segments[slot].size);
+#endif
+    if (err != 0) {
+        FARF(ERROR, "[DSP-VA] unmap failed slot=%u err=%d", slot, err);
+        return false;
+    }
+    ctx->rpc_segments[slot].base = NULL;
+    if (ctx->dsp_va_window_mb) {
+        ctx->dsp_va_mapped_bytes -= ctx->rpc_segments[slot].size;
+        ctx->dsp_va_evict_count++;
+        weight_inval_reset_all();
+    }
+    return true;
+}
+
 AEEResult ggml_htp_register_rpcmem_segment(remote_handle64 h, uint32_t slot, uint32_t ion_fd, uint32_t size_lo, uint32_t size_hi) {
     struct dsp_context * ctx = (struct dsp_context *)h;
     uint64_t size = ((uint64_t)size_hi << 32) | size_lo;
     if (!ctx || slot == 0 || slot >= DSP_RPCMEM_MAX_SEGMENTS || !size ||
-        size > UINT32_MAX || ctx->rpc_segments[slot].base) return AEE_EBADPARM;
+        size > UINT32_MAX || ctx->rpc_segments[slot].size) return AEE_EBADPARM;
+    void * va = NULL;
+    if (!ctx->dsp_va_window_mb) {
 #if __HVX_ARCH__ > 73
-    void * va = HAP_mmap2(NULL, (size_t)size, HAP_PROT_READ | HAP_PROT_WRITE, 0, (int32_t)ion_fd, 0);
+        va = HAP_mmap2(NULL, (size_t)size, HAP_PROT_READ | HAP_PROT_WRITE, 0, (int32_t)ion_fd, 0);
 #else
-    void * va = HAP_mmap(NULL, (size_t)size, HAP_PROT_READ | HAP_PROT_WRITE, 0, (int32_t)ion_fd, 0);
+        va = HAP_mmap(NULL, (size_t)size, HAP_PROT_READ | HAP_PROT_WRITE, 0, (int32_t)ion_fd, 0);
 #endif
-    if (!va || va == (void *)-1) return AEE_EFAILED;
+        if (!va || va == (void *)-1) return AEE_EFAILED;
+    }
     ctx->rpc_segments[slot].base = va;
     ctx->rpc_segments[slot].size = (size_t)size;
-    FARF(ALWAYS, "[RPC-SEG] map slot=%u fd=%u size=%u MiB va=%p",
+    ctx->rpc_segments[slot].fd = (int32_t)ion_fd;
+    ctx->rpc_segments[slot].last_use = 0;
+    FARF(ALWAYS, "[RPC-SEG] %s slot=%u fd=%u size=%u MiB va=%p",
+         ctx->dsp_va_window_mb ? "lazy-register" : "map",
          slot, ion_fd, (unsigned)(size >> 20), va);
     return AEE_SUCCESS;
 }
@@ -1956,15 +1982,78 @@ AEEResult ggml_htp_register_rpcmem_segment(remote_handle64 h, uint32_t slot, uin
 AEEResult ggml_htp_unregister_rpcmem_segment(remote_handle64 h, uint32_t slot) {
     struct dsp_context * ctx = (struct dsp_context *)h;
     if (!ctx || slot == 0 || slot >= DSP_RPCMEM_MAX_SEGMENTS ||
-        !ctx->rpc_segments[slot].base) return AEE_EBADPARM;
-#if __HVX_ARCH__ > 73
-    HAP_munmap2(ctx->rpc_segments[slot].base, ctx->rpc_segments[slot].size);
-#else
-    HAP_munmap(ctx->rpc_segments[slot].base, ctx->rpc_segments[slot].size);
-#endif
+        !ctx->rpc_segments[slot].size) return AEE_EBADPARM;
+    if (!dsp_va_unmap_slot(ctx, slot)) return AEE_EFAILED;
     ctx->rpc_segments[slot].base = NULL;
     ctx->rpc_segments[slot].size = 0;
+    ctx->rpc_segments[slot].fd = -1;
+    ctx->rpc_segments[slot].last_use = 0;
     return AEE_SUCCESS;
+}
+
+// Only weight mappings are managed dynamically; workspace and activations
+// stay mapped. Caller must suspend+flush HMX/DMA queues before eviction.
+static bool dsp_va_prepare_op(const uint8_t needed[DSP_RPCMEM_MAX_SEGMENTS]) {
+    struct dsp_context * ctx = g_dsp_ctx;
+    const uint64_t budget = (uint64_t)ctx->dsp_va_window_mb << 20;
+    const uint32_t tick = ++ctx->dsp_va_tick;
+    for (uint32_t slot = 1; slot < DSP_RPCMEM_MAX_SEGMENTS; slot++) {
+        if (needed[slot]) ctx->rpc_segments[slot].last_use = tick;
+    }
+    for (uint32_t slot = 1; slot < DSP_RPCMEM_MAX_SEGMENTS; slot++) {
+        if (!needed[slot] || ctx->rpc_segments[slot].base) continue;
+        const size_t size = ctx->rpc_segments[slot].size;
+        if (!size || size > budget) {
+            FARF(ERROR, "[DSP-VA] invalid slot=%u size=%zu budget=%llu", slot, size, (unsigned long long)budget);
+            return false;
+        }
+        while (ctx->dsp_va_mapped_bytes + size > budget) {
+            uint32_t victim = 0;
+            uint32_t oldest = UINT32_MAX;
+            for (uint32_t j = 1; j < DSP_RPCMEM_MAX_SEGMENTS; j++) {
+                if (!needed[j] && ctx->rpc_segments[j].base &&
+                    ctx->rpc_segments[j].last_use <= oldest) {
+                    oldest = ctx->rpc_segments[j].last_use;
+                    victim = j;
+                }
+            }
+            if (!victim || !dsp_va_unmap_slot(ctx, victim)) {
+                FARF(ERROR, "[DSP-VA] no safe eviction for slot=%u size=%zu", slot, size);
+                return false;
+            }
+        }
+        void * va = NULL;
+        for (int attempt = 0; attempt < 2; attempt++) {
+#if __HVX_ARCH__ > 73
+            va = HAP_mmap2(NULL, size, HAP_PROT_READ | HAP_PROT_WRITE, 0, ctx->rpc_segments[slot].fd, 0);
+#else
+            va = HAP_mmap(NULL, size, HAP_PROT_READ | HAP_PROT_WRITE, 0, ctx->rpc_segments[slot].fd, 0);
+#endif
+            if (va && va != (void *)-1) break;
+            va = NULL;
+            if (attempt == 0) {
+                for (uint32_t j = 1; j < DSP_RPCMEM_MAX_SEGMENTS; j++) {
+                    if (!needed[j] && ctx->rpc_segments[j].base &&
+                        !dsp_va_unmap_slot(ctx, j)) return false;
+                }
+            }
+        }
+        if (!va) {
+            FARF(ERROR, "[DSP-VA] map failed slot=%u size=%zu mapped=%llu budget=%llu",
+                 slot, size, (unsigned long long)ctx->dsp_va_mapped_bytes, (unsigned long long)budget);
+            return false;
+        }
+        ctx->rpc_segments[slot].base = va;
+        ctx->dsp_va_mapped_bytes += size;
+        ctx->dsp_va_map_count++;
+        weight_inval_reset_all();
+        if (ctx->dsp_va_map_count <= 16 || (ctx->dsp_va_map_count % 128) == 0) {
+            FARF(ALWAYS, "[DSP-VA] map slot=%u va=%p active=%llu MiB maps=%llu evictions=%llu",
+                 slot, va, (unsigned long long)(ctx->dsp_va_mapped_bytes >> 20),
+                 (unsigned long long)ctx->dsp_va_map_count, (unsigned long long)ctx->dsp_va_evict_count);
+        }
+    }
+    return true;
 }
 
 // Wake/suspend the work_queue + hmx_queue worker threads around a batch,
