@@ -841,6 +841,12 @@ struct llama_model {
     // list of devices used in this model
     std::vector<llama_device> devices;
 
+    struct htp_weight_plan {
+        ggml_backend_dev_t device = nullptr;
+        std::vector<size_t> chunks;
+    };
+    std::vector<htp_weight_plan> htp_weight_plans;
+
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
