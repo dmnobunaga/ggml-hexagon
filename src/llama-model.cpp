@@ -1595,6 +1595,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int n_gpu_layers = this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
+    const char * adaptive_env = std::getenv("GGML_HEXAGON_ADAPTIVE_OFFLOAD");
+    const char * segmented_env = std::getenv("GGML_HEXAGON_SEGMENTED_RPCMEM");
+    const bool adaptive_htp = adaptive_env && std::strcmp(adaptive_env, "1") == 0 &&
+                              segmented_env && std::strcmp(segmented_env, "1") == 0;
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
@@ -1602,11 +1606,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(dev.dev, &props);
-            if (!props.caps.mmap_support) {
+            const char * dev_name = ggml_backend_dev_name(dev.dev);
+            const bool is_htp = dev_name && std::strncmp(dev_name, "HTP", 3) == 0;
+            if (!props.caps.mmap_support && !(adaptive_htp && is_htp)) {
                 ml.use_mmap = false;
                 break;
             }
         }
+    }
+
+    if (adaptive_htp && ml.use_mmap) {
+        LLAMA_LOG_INFO("[HTP-OFFLOAD] preserving CPU file mmap with HTP staging buffers\n");
     }
 
     // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
@@ -1898,7 +1908,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // Adaptive HTP uses the GGUF mapping as CPU backing and HTP upload source.
+    // Do not request a full-file prefetch on memory-constrained Android devices.
+    ml.init_mappings(!ml.no_alloc && !adaptive_htp, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1914,6 +1926,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (!ml.no_alloc) {
         const size_t MiB = 1024 * 1024;
         size_t planned_cpu = 0;
+        size_t planned_cpu_mmap = 0;
         size_t planned_htp_bytes = 0;
         const char * segmented_env = std::getenv("GGML_HEXAGON_SEGMENTED_RPCMEM");
         const bool segmented_rpcmem = segmented_env && std::strcmp(segmented_env, "1") == 0;
@@ -1969,6 +1982,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     throw std::runtime_error("CPU memory preflight failed: size overflow");
                 }
                 planned_cpu += bytes;
+                if (adaptive_htp && ml.use_mmap && dev &&
+                    ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    ggml_backend_dev_props props;
+                    ggml_backend_dev_get_props(dev, &props);
+                    if (props.caps.buffer_from_host_ptr &&
+                        buft == ggml_backend_dev_buffer_type(dev)) {
+                        planned_cpu_mmap += bytes;
+                    }
+                }
             }
         }
 
@@ -2018,7 +2040,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
 
             const size_t available_mb = (size_t) available_kib / 1024;
-            const size_t planned_cpu_mb = planned_cpu / MiB + (planned_cpu % MiB != 0);
+            const size_t planned_cpu_anon = planned_cpu - planned_cpu_mmap;
+            const size_t planned_cpu_mb = planned_cpu_anon / MiB + (planned_cpu_anon % MiB != 0);
+            if (adaptive_htp) {
+                LLAMA_LOG_INFO("[MEM-GUARD] CPU file-backed mmap=%.2f MiB anonymous=%.2f MiB\n",
+                               (double) planned_cpu_mmap / MiB, (double) planned_cpu_anon / MiB);
+            }
             size_t already_reserved_htp = 0;
             if (segmented_rpcmem) {
                 const char * adaptive = std::getenv("GGML_HEXAGON_ADAPTIVE_OFFLOAD");
@@ -2143,7 +2170,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if (!ml.no_alloc && (ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             const size_t max_size = ggml_get_max_tensor_size(ctx);
 
