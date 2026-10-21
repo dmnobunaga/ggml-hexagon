@@ -29,7 +29,12 @@ DSP (close path only):
 
 - Logs entry, segment cleanup, work/DMA cleanup, HMX cleanup, compute
   resource release, and function exit.
-- Leaves teardown operations and error-return semantics unchanged.
+- On the base `experiment/fastrpc-close-handle` diagnostic branch,
+  teardown operations are unchanged.
+- On the descendant `experiment/fastrpc-close-workspace-unmap` branch,
+  the close function also calls `HAP_munmap2` on the main DSP workspace
+  after worker/HMX queues are destroyed and before releasing compute
+  resources. Failure is logged and returned as `AEE_EFAILED`.
 
 **Do not treat `AEE_EBADHANDLE` as success.** Some FastRPC versions can
 invalidate local handle bookkeeping on a failed close attempt; blindly
@@ -96,7 +101,20 @@ path; that fact alone does not prove the function was reached on failing runs.
 - If FastRPC handle close bookkeeping is implicated, inspect the device
   libcdsprpc behavior / logcat and the generated QAIC stub/skeleton
   contract; do not assume the open remote handle is safe to reuse.
-- Verify `ggml_htp_close` actually unmaps its workspace: the current DSP
-  implementation clears segmented mappings but does not explicitly
-  unmap `mempool_dsp_base` before freeing context. Investigate this
-  separately from `AEE_EBADHANDLE`.
+- Compare the diagnostic-only branch against the workspace-unmap branch.
+  A successful workspace unmap is a cleanup correctness improvement,
+  but does not establish that it fixes `AEE_EBADHANDLE` until tested.
+
+## Two-stage test to isolate the patch
+
+1. First test this **workspace-unmap** branch with the short command above.
+   Look for `[CLOSE-DIAG] DSP workspace unmapped` and the final AP
+   `close returned=...` line.
+2. If the close error persists, test **diagnostic-only**
+   `experiment/fastrpc-close-handle` with matching AP/DSP artifacts,
+   to determine whether explicit workspace unmapping changes the error.
+3. Only after a successful close, test two model load/run/unload cycles
+   **in the same process** to detect retained handle state and resource leaks.
+
+Neither branch has been compiled or run on hardware from this session.
+Do not deploy over the known-good `f308c7499` binaries without backup.
