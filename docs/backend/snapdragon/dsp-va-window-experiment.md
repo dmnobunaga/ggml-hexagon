@@ -10,8 +10,10 @@ The regular segmented FastRPC backend registers every weight segment with
 DSPQueue can use smaller working sets and reclaim ordinary DSP VA mappings.
 This opt-in mode keeps all weights in host-side RPCMEM but stores FD/size
 metadata on the DSP and lazily maps weight segments just before operations
-that consume them. When the configured mapping budget is reached, inactive
-segments are evicted by LRU.
+that consume them. On-demand writable runtime buffers are instead mapped immediately and permanently
+pinned for their lifetime. The window accounts for both resident weight mappings
+and pinned runtime mappings. When the budget is reached, only inactive
+**weight** mappings are evicted by LRU.
 
 An eviction occurs only after suspending/flushing HMX and work queues.
 The mode converts segment-based tensor descriptors immediately before
@@ -19,9 +21,13 @@ operations, since previously cached DSP pointers may have become stale.
 
 **Safety constraints**
 - Only segmented RPCMEM is supported.
-- The window applies to weight segments only; workspace stays permanently mapped.
-- A non-weight tensor found in a segmented buffer aborts the batch.
-- The sum of segment sizes needed by one operation must fit the window.
+- Workspace stays permanently mapped outside the configured window budget.
+- Weight-plan reservations are evictable; newly allocated runtime segments are
+  pinned and writable. A write into an evictable weight segment fails safely.
+- Runtime allocations are conservatively treated as writable even if they
+  happen to contain a weight; this may reduce available window capacity.
+- The sum of pinned runtime segments and weight segments needed for one op
+  must fit the configured window.
 - Failure to unmap or map an active segment returns an error; it must not
   silently fall back to stale addresses.
 - Session shutdown error `ggml_htp_close() = 0x2c` is not addressed here.
@@ -34,6 +40,8 @@ Build the **FastRPC/mempool** variant:
 `-DGGML_HEXAGON_USE_MEMPOOL=ON`. Install matching AP binaries/libraries
 and the DSP skeleton `libggml-htp-v81.so` together.
 Do not mix this branch's DSP skeleton with an older host library.
+The FastRPC IDL `register_rpcmem_segment` signature changed to include
+`pinned`; regenerate/rebuild AP stubs and the DSP skeleton together.
 
 ## A/B procedure
 
@@ -77,7 +85,8 @@ Vary `-ngl` to match actual offloaded layers when comparing performance.
 
 ## Diagnostics
 
-Look for `[DSP-VA] weight mapping window=`, `[RPC-SEG] lazy-register`,
+Look for `[DSP-VA] weight mapping window=`, `[RPC-SEG] lazy-weight`,
+`[RPC-SEG] eager` with `pinned=1`,
 `[DSP-VA] map`, `[DSP-VA] map failed`, and `[DSP-VA] unmap failed`
 in `adb logcat`. Host `[HTP-OFFLOAD]` summary prints the selected window
 and effective number of layers.
