@@ -2271,10 +2271,16 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
             const hex_op_desc * op = &ops[i];
             for (int d = 0; d < HTP_OP_MAX_OUTPUTS; d++) {
                 const int32_t ti = op->dst_idx[d];
-                if (ti >= 0 && tens[ti].segment_id != 0 &&
-                    !g_dsp_ctx->rpc_segments[tens[ti].segment_id].pinned) {
+                if (ti < 0) continue;
+                const uint32_t dst_slot = tens[ti].segment_id;
+                if (dst_slot >= DSP_RPCMEM_MAX_SEGMENTS) {
+                    GGMLHEXAGON_LOG_ERROR("[DSP-VA] op=%u dst[%d] tensor=%d invalid segment=%u",
+                                          i, d, ti, dst_slot);
+                    return AEE_EBADPARM;
+                }
+                if (dst_slot != 0 && !g_dsp_ctx->rpc_segments[dst_slot].pinned) {
                     GGMLHEXAGON_LOG_ERROR("[DSP-VA] op=%u dst[%d] tensor=%d writes evictable weight segment=%u",
-                                          i, d, ti, tens[ti].segment_id);
+                                          i, d, ti, dst_slot);
                     return AEE_EBADPARM;
                 }
             }
