@@ -1996,10 +1996,6 @@ AEEResult ggml_htp_unregister_rpcmem_segment(remote_handle64 h, uint32_t slot) {
 static bool dsp_va_prepare_op(const uint8_t needed[DSP_RPCMEM_MAX_SEGMENTS]) {
     struct dsp_context * ctx = g_dsp_ctx;
     const uint64_t budget = (uint64_t)ctx->dsp_va_window_mb << 20;
-    const uint32_t tick = ++ctx->dsp_va_tick;
-    for (uint32_t slot = 1; slot < DSP_RPCMEM_MAX_SEGMENTS; slot++) {
-        if (needed[slot]) ctx->rpc_segments[slot].last_use = tick;
-    }
     for (uint32_t slot = 1; slot < DSP_RPCMEM_MAX_SEGMENTS; slot++) {
         if (!needed[slot] || ctx->rpc_segments[slot].base) continue;
         const size_t size = ctx->rpc_segments[slot].size;
@@ -2340,12 +2336,15 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
         if (g_dsp_ctx->dsp_va_window_mb) {
             uint8_t needed[DSP_RPCMEM_MAX_SEGMENTS] = {0};
             bool need_map = false;
+            const uint32_t use_tick = ++g_dsp_ctx->dsp_va_tick;
             for (int k = 0; k < HTP_OP_MAX_INPUTS + HTP_OP_MAX_OUTPUTS; k++) {
                 int32_t ti = k < HTP_OP_MAX_INPUTS ? op->src_idx[k] : op->dst_idx[k - HTP_OP_MAX_INPUTS];
                 if (ti < 0) continue;
                 uint32_t slot = tens[ti].segment_id;
                 if (!slot) continue;
                 needed[slot] = 1;
+                // Update LRU recency on every operation, including cache hits.
+                g_dsp_ctx->rpc_segments[slot].last_use = use_tick;
                 if (!g_dsp_ctx->rpc_segments[slot].base) need_map = true;
             }
             if (need_map) {
