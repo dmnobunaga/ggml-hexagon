@@ -1,7 +1,7 @@
 # Experimental DSP VA window (FastRPC mempool backend)
 
 This branch is a prototype. The stable `experiment/adaptive-htp-offload` branch is unchanged.
-This feature is **disabled by default**, and has not yet been built or run on hardware.
+This feature is **disabled by default**. It has been exercised on Snapdragon 8 Elite Gen 5 (Hexagon v81), but remains experimental.
 
 ## Purpose
 
@@ -30,7 +30,7 @@ operations, since previously cached DSP pointers may have become stale.
   must fit the configured window.
 - Failure to unmap or map an active segment returns an error; it must not
   silently fall back to stale addresses.
-- Session shutdown error `ggml_htp_close() = 0x2c` is not addressed here.
+- Session shutdown error `ggml_htp_close() = 0x2c` persists after successful benchmarks. It is tracked separately; the origin of the error is not yet proven.
 - DSPQueue DMA64 extended mapping is **not** used by this prototype.
 - `-ngl 99` may still be restricted by host RAM headroom; start with fixed `-ngl 16`.
 
@@ -91,6 +91,64 @@ Look for `[DSP-VA] weight mapping window=`, `[RPC-SEG] lazy-weight`,
 in `adb logcat`. Host `[HTP-OFFLOAD]` summary prints the selected window
 and effective number of layers.
 
-The current prototype has no on-device CI or verified performance data.
-Do **not** interpret a successful model load as proof that PP/TG will execute
-correctly. Test incrementally and retain baseline binaries for rollback.
+No automated on-device CI currently verifies the implementation. Benchmarks have
+confirmed that PP and TG execute; deterministic token-by-token numerical
+correctness is **not yet verified**. Test incrementally and retain baseline
+binaries for rollback.
+
+## Verified on-device checkpoint — 2026-10-21
+
+Environment: Snapdragon 8 Elite Gen 5, HTP v81, Spark-X2.5-4B BF16
+(4.11B parameters, 7.66 GiB GGUF), `-t 6 --poll 1000 -fa 1`,
+`--ubatch-size 128`. All measurements in this section were supplied by
+the device operator; they are not CI measurements.
+
+**Artifact/build tested**: `f308c7499` (llama-bench build 12481).
+This is an earlier experimental branch snapshot, **not** a validation of
+subsequent source edits on the branch.
+
+| Configuration | PP | TG | Repeats | Interpretation |
+| --- | ---: | ---: | ---: | --- |
+| FastRPC, 15 layers, VA window **OFF** | PP128 6.13 ± 1.26 t/s | TG32 3.08 ± 1.12 t/s | 3 | Matched A/B baseline |
+| FastRPC, 15 layers, VA window 2560 MiB | PP128 6.44 ± 0.18 t/s | TG32 3.74 ± 0.22 t/s | 3 | Matched A/B experimental |
+| FastRPC, 16 layers, VA window 2560 MiB | PP16 4.49 t/s | TG4 3.24 t/s | 1 | PP and TG completed |
+| FastRPC, 24 layers, VA window 2560 MiB | PP16 10.52 t/s | TG4 4.60 t/s | 1 | PP and TG completed |
+| FastRPC, 24 layers, VA window 2560 MiB | PP128 6.83 ± 0.27 t/s | TG64 4.48 ± 0.20 t/s | 3 | Longer PP/TG run completed |
+
+At 24 layers: `effective_ngl=24`, 12 weight segments registered,
+`dsp_weight_mapped=5242.30 MiB` (segment allocations, **not** simultaneous
+resident DSP VA), workspace 256 MiB; CPU file-backed weight mapping
+3241.27 MiB. The reported DSP VA window is 2560 MiB and excludes
+the permanently mapped workspace. Reported `extended_map=0`.
+
+**Direct mapping evidence** from `adb logcat` captured during a PP16/TG4
+run: weight slots 1–12 registered `lazy-weight ... pinned=0`; runtime
+slots 13–15 registered `eager ... pinned=1` (6.00, 17.00, 8.16 MiB
+initially); `[DSP-VA] map` logs show maps and evictions growing.
+The 16th logged weight mapping reports `maps=16 evictions=11 active=2032
+MiB`. These are **partial counters**, not whole-benchmark totals:
+mapping logs stop after the first 16 and only repeat every 128 maps.
+
+The matched 15-layer A/B in this checkpoint did **not** show a throughput
+regression from enabling the VA window (6.13→6.44 PP128, 3.08→3.74 TG32),
+but run-to-run variance is significant. Older 15-layer FastRPC tests
+reported TG ≈5.38–5.62 t/s under different conditions. They are not
+directly comparable with this A/B or the 24-layer TG64 result; no global
+performance winner has been established.
+
+**Known limitations and follow-ups**:
+1. `ggml_htp_close()` consistently reports `0x2c`, including after
+   successful PP/TG. Cleanup is deferred to process exit; repeated
+   load/unload within one process remains unverified.
+2. No deterministic cross-backend logits/token correctness comparison.
+3. No per-graph DSP VA `map_count`, `evict_count`, mapping latency, or
+   queue synchronization timing; CPU/DSP per-stage profiling is needed.
+4. Small-model PP/TG regression suite is pending; verify both default
+   mode (VA window unset) and opt-in mode.
+5. Large-model memory headroom varied between runs; swapping and device
+   thermal state can influence throughput.
+
+**Milestone**: the data demonstrate working BF16 FastRPC inference with a
+5.24-GiB weight allocation and active weight remapping inside a 2.5-GiB
+DSP VA window. They do **not** prove all weights fit in DSP address
+space simultaneously, nor that the close error is harmless.
