@@ -1673,7 +1673,11 @@ int ggml_htp_open(const char * uri, remote_handle64 * handle) {
 
 int ggml_htp_close(remote_handle64 handle) {
     struct dsp_context * ctx = (struct dsp_context *)handle;
-    if (!ctx) return 0;
+    FARF(ALWAYS, "[CLOSE-DIAG] DSP close enter handle=%p", (void *)(uintptr_t)handle);
+    if (!ctx) {
+        FARF(ALWAYS, "[CLOSE-DIAG] DSP null handle, returning 0");
+        return 0;
+    }
     g_dsp_ctx = ctx;
     for (uint32_t slot = 1; slot < DSP_RPCMEM_MAX_SEGMENTS; slot++) {
         if (!ctx->rpc_segments[slot].base) continue;
@@ -1686,6 +1690,7 @@ int ggml_htp_close(remote_handle64 handle) {
         ctx->rpc_segments[slot].size = 0;
     }
 
+    FARF(ALWAYS, "[CLOSE-DIAG] DSP segment cleanup completed");
     // Cleanup htp_context resources (work_queue + dma queues).
     // New Qualcomm API (b2dd28a3b): *_queue_free() does not free the backing
     // buffer, so we track them in dsp_context and free them explicitly here.
@@ -1716,6 +1721,7 @@ int ggml_htp_close(remote_handle64 handle) {
         ctx->htp_ctx = NULL;
     }
 
+    FARF(ALWAYS, "[CLOSE-DIAG] DSP work/DMA cleanup completed");
     if (ctx->hmx_queue != NULL) {
         hmx_queue_free(ctx->hmx_queue);
         ctx->hmx_queue = NULL;
@@ -1731,6 +1737,7 @@ int ggml_htp_close(remote_handle64 handle) {
      * set vtcm_needs_release=1 if another session preempts during the
      * session, but we intentionally ignore it here so that VTCM stays
      * cached for the full session. */
+    FARF(ALWAYS, "[CLOSE-DIAG] DSP HMX queue cleanup completed");
     dsp_vtcm_release();
 
     if (ctx->compute_res_ctx_id != 0) {
@@ -1745,8 +1752,10 @@ int ggml_htp_close(remote_handle64 handle) {
         GGMLHEXAGON_LOG_INFO("released compute resources");
     }
 
+    FARF(ALWAYS, "[CLOSE-DIAG] DSP compute resources released; freeing session");
     g_dsp_ctx = NULL;
     free(ctx);
+    FARF(ALWAYS, "[CLOSE-DIAG] DSP close exit success");
     return 0;
 }
 
