@@ -2229,6 +2229,23 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
         }
     }
 
+    // Dynamic VA segments are allowed as input storage only. Evicting a
+    // writable output segment would lose or obscure DSP-generated state.
+    // Enforce this on actual op destinations, not the first-touch cache hint.
+    if (g_dsp_ctx->dsp_va_window_mb) {
+        for (uint32_t i = 0; i < hdr->n_ops; i++) {
+            const hex_op_desc * op = &ops[i];
+            for (int d = 0; d < HTP_OP_MAX_OUTPUTS; d++) {
+                const int32_t ti = op->dst_idx[d];
+                if (ti >= 0 && tens[ti].segment_id != 0) {
+                    GGMLHEXAGON_LOG_ERROR("[DSP-VA] op=%u dst[%d] tensor=%d uses evictable segment=%u; writable segment unsupported",
+                                          i, d, ti, tens[ti].segment_id);
+                    return AEE_EBADPARM;
+                }
+            }
+        }
+    }
+
     /* Validate per-tensor data ranges against the mempool mapping. Catches
      * corrupted descriptors (e.g. stale offsets from the AP side) before
      * they become wild reads/writes anywhere in DSP address space. */
@@ -2238,12 +2255,14 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
         const uint32_t slot = tens[ti].segment_id;
         if (slot >= DSP_RPCMEM_MAX_SEGMENTS) return AEE_EBADPARM;
         const size_t capacity = slot ? g_dsp_ctx->rpc_segments[slot].size : g_dsp_ctx->mempool_dsp_size;
+        // flags & 2 is the MUL_MAT weight-cache hint, not proof that a
+        // tensor belongs to a weight segment. Norm/embedding tensors may be
+        // read-only in RPCMEM with flags == 0. Permit these reads.
         if ((slot && !g_dsp_ctx->rpc_segments[slot].size) ||
             (slot && !g_dsp_ctx->dsp_va_window_mb && !g_dsp_ctx->rpc_segments[slot].base) ||
-            (slot && g_dsp_ctx->dsp_va_window_mb && !(tens[ti].flags & 2u)) ||
             off >= capacity || len > capacity - off) {
-            GGMLHEXAGON_LOG_ERROR("tensor %u: invalid segment=%u off=%u len=%u cap=%zu",
-                                  ti, slot, off, len, capacity);
+            GGMLHEXAGON_LOG_ERROR("tensor %u: invalid segment=%u flags=0x%x off=%u len=%u cap=%zu window=%u",
+                                  ti, slot, tens[ti].flags, off, len, capacity, g_dsp_ctx->dsp_va_window_mb);
             return AEE_EBADPARM;
         }
     }
