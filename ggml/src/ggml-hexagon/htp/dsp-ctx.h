@@ -198,6 +198,7 @@ struct dsp_context {
         size_t size;
         int32_t fd;
         uint32_t last_use;
+        uint32_t pinned;
     } rpc_segments[DSP_RPCMEM_MAX_SEGMENTS];
     uint32_t dsp_va_window_mb;
     uint32_t dsp_va_tick;
