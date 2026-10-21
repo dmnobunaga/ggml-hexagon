@@ -2268,9 +2268,28 @@ static void ggmlhexagon_deinit_rpcmempool(ggml_backend_hexagon_context * ctx) {
 static void ggmlhexagon_deinit_cdsp(ggml_backend_hexagon_context * ctx) {
     GGMLHEXAGON_LOG_ALWAYS("enter %s", __FUNCTION__);
     int hexagon_error  = AEE_SUCCESS;
+    const char * close_diag_env = getenv("GGML_HEXAGON_CLOSE_DIAG");
+    const bool close_diag = close_diag_env && strcmp(close_diag_env, "1") == 0;
     if (ctx->ggmlop_handle != 0) {
+        if (close_diag) {
+            GGMLHEXAGON_LOG_ALWAYS("[CLOSE-DIAG] begin handle=0x%llx segments=%zu workspace=%zuMiB domain=%d",
+                (unsigned long long)ctx->ggmlop_handle, ctx->rpc_segments.size(),
+                ctx->rpc_mempool_len / SIZE_IN_MB, ctx->domain_id);
+        }
         ggmlhexagon_deinit_rpc_segments(ctx);
+        if (close_diag) {
+            // Harmless RPC with no weights or graph state. If it succeeds after
+            // segment teardown, the same local handle was valid immediately
+            // before the close. This must run before unmapping the workspace.
+            const int probe_err = ggml_htp_execute_batch(ctx->ggmlop_handle, 0, 0xFFFB);
+            GGMLHEXAGON_LOG_ALWAYS("[CLOSE-DIAG] pre-close invoke=0x%x handle=0x%llx segments_left=%zu",
+                probe_err, (unsigned long long)ctx->ggmlop_handle, ctx->rpc_segments.size());
+        }
         hexagon_error = ggml_htp_close(ctx->ggmlop_handle);
+        if (close_diag) {
+            GGMLHEXAGON_LOG_ALWAYS("[CLOSE-DIAG] close returned=0x%x handle=0x%llx",
+                hexagon_error, (unsigned long long)ctx->ggmlop_handle);
+        }
         if (AEE_SUCCESS != hexagon_error) {
             GGMLHEXAGON_LOG_ERROR("error 0x%x: failed to close ggmlop dsp handle", hexagon_error);
         }
