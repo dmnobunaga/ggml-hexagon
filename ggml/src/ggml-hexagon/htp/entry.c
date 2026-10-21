@@ -1738,6 +1738,28 @@ int ggml_htp_close(remote_handle64 handle) {
      * session, but we intentionally ignore it here so that VTCM stays
      * cached for the full session. */
     FARF(ALWAYS, "[CLOSE-DIAG] DSP HMX queue cleanup completed");
+
+    // The main workspace is mapped separately by register_rpcmem().
+    // It is not part of rpc_segments[] and must be explicitly unmapped.
+    // All worker/HMX queues are now stopped and destroyed, so no DSP code
+    // should retain an address inside this workspace.
+    int workspace_unmap_err = 0;
+    if (ctx->mempool_dsp_base && ctx->mempool_dsp_size) {
+#if __HVX_ARCH__ > 73
+        workspace_unmap_err = HAP_munmap2(ctx->mempool_dsp_base, ctx->mempool_dsp_size);
+#else
+        workspace_unmap_err = HAP_munmap(ctx->mempool_dsp_base, ctx->mempool_dsp_size);
+#endif
+        if (workspace_unmap_err != 0) {
+            FARF(ERROR, "[CLOSE-DIAG] DSP workspace HAP_munmap failed err=%d base=%p size=%zu",
+                 workspace_unmap_err, ctx->mempool_dsp_base, ctx->mempool_dsp_size);
+        } else {
+            FARF(ALWAYS, "[CLOSE-DIAG] DSP workspace unmapped base=%p size=%zu",
+                 ctx->mempool_dsp_base, ctx->mempool_dsp_size);
+            ctx->mempool_dsp_base = NULL;
+            ctx->mempool_dsp_size = 0;
+        }
+    }
     dsp_vtcm_release();
 
     if (ctx->compute_res_ctx_id != 0) {
@@ -1755,8 +1777,8 @@ int ggml_htp_close(remote_handle64 handle) {
     FARF(ALWAYS, "[CLOSE-DIAG] DSP compute resources released; freeing session");
     g_dsp_ctx = NULL;
     free(ctx);
-    FARF(ALWAYS, "[CLOSE-DIAG] DSP close exit success");
-    return 0;
+    FARF(ALWAYS, "[CLOSE-DIAG] DSP close exit workspace_unmap_err=%d", workspace_unmap_err);
+    return workspace_unmap_err == 0 ? AEE_SUCCESS : AEE_EFAILED;
 }
 
 AEEResult ggml_htp_setclocks(remote_handle64 handle, int32 diag_info, int32 requested_thread_counts, int32 * actual_thread_counts) {
