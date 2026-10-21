@@ -1949,36 +1949,73 @@ static bool dsp_va_unmap_slot(struct dsp_context * ctx, uint32_t slot) {
     ctx->rpc_segments[slot].base = NULL;
     if (ctx->dsp_va_window_mb) {
         ctx->dsp_va_mapped_bytes -= ctx->rpc_segments[slot].size;
-        ctx->dsp_va_evict_count++;
+        if (!ctx->rpc_segments[slot].pinned) ctx->dsp_va_evict_count++;
         weight_inval_reset_all();
     }
     return true;
 }
 
-AEEResult ggml_htp_register_rpcmem_segment(remote_handle64 h, uint32_t slot, uint32_t ion_fd, uint32_t size_lo, uint32_t size_hi) {
+AEEResult ggml_htp_register_rpcmem_segment(remote_handle64 h, uint32_t slot, uint32_t ion_fd,
+                                            uint32_t size_lo, uint32_t size_hi, uint32_t pinned) {
     struct dsp_context * ctx = (struct dsp_context *)h;
     uint64_t size = ((uint64_t)size_hi << 32) | size_lo;
     if (!ctx || slot == 0 || slot >= DSP_RPCMEM_MAX_SEGMENTS || !size ||
-        size > UINT32_MAX || ctx->rpc_segments[slot].size) return AEE_EBADPARM;
+        size > UINT32_MAX || pinned > 1 || ctx->rpc_segments[slot].size) return AEE_EBADPARM;
+
+    const bool pin_runtime = ctx->dsp_va_window_mb && pinned;
+    const bool lazy_weight = ctx->dsp_va_window_mb && !pinned;
+    if (pin_runtime) {
+        const uint64_t budget = (uint64_t)ctx->dsp_va_window_mb << 20;
+        if (size > budget) {
+            FARF(ERROR, "[DSP-VA] pinned segment too large slot=%u size=%llu budget=%llu",
+                 slot, (unsigned long long)size, (unsigned long long)budget);
+            return AEE_EFAILED;
+        }
+        // Registration happens between synchronous compute batches; release
+        // inactive weight mappings to leave room for persistent activations.
+        while (ctx->dsp_va_mapped_bytes + size > budget) {
+            uint32_t victim = 0;
+            uint32_t oldest = UINT32_MAX;
+            for (uint32_t j = 1; j < DSP_RPCMEM_MAX_SEGMENTS; j++) {
+                if (!ctx->rpc_segments[j].pinned && ctx->rpc_segments[j].base &&
+                    ctx->rpc_segments[j].last_use <= oldest) {
+                    oldest = ctx->rpc_segments[j].last_use;
+                    victim = j;
+                }
+            }
+            if (!victim || !dsp_va_unmap_slot(ctx, victim)) {
+                FARF(ERROR, "[DSP-VA] pinned registration cannot evict enough weight VA slot=%u", slot);
+                return AEE_EFAILED;
+            }
+        }
+    }
+
     void * va = NULL;
-    if (!ctx->dsp_va_window_mb) {
+    if (!lazy_weight) {
 #if __HVX_ARCH__ > 73
         va = HAP_mmap2(NULL, (size_t)size, HAP_PROT_READ | HAP_PROT_WRITE, 0, (int32_t)ion_fd, 0);
 #else
         va = HAP_mmap(NULL, (size_t)size, HAP_PROT_READ | HAP_PROT_WRITE, 0, (int32_t)ion_fd, 0);
 #endif
-        if (!va || va == (void *)-1) return AEE_EFAILED;
+        if (!va || va == (void *)-1) {
+            FARF(ERROR, "[DSP-VA] eager mapping failed slot=%u pinned=%u size=%llu",
+                 slot, pinned, (unsigned long long)size);
+            return AEE_EFAILED;
+        }
     }
+
     ctx->rpc_segments[slot].base = va;
     ctx->rpc_segments[slot].size = (size_t)size;
     ctx->rpc_segments[slot].fd = (int32_t)ion_fd;
     ctx->rpc_segments[slot].last_use = 0;
-    FARF(ALWAYS, "[RPC-SEG] %s slot=%u fd=%u size=%u MiB va=%p",
-         ctx->dsp_va_window_mb ? "lazy-register" : "map",
-         slot, ion_fd, (unsigned)(size >> 20), va);
+    ctx->rpc_segments[slot].pinned = pin_runtime ? 1u : 0u;
+    if (pin_runtime) ctx->dsp_va_mapped_bytes += size;
+    FARF(ALWAYS, "[RPC-SEG] %s slot=%u fd=%u size=%u MiB va=%p pinned=%u active=%llu MiB",
+         lazy_weight ? "lazy-weight" : "eager",
+         slot, ion_fd, (unsigned)(size >> 20), va, (unsigned)pin_runtime,
+         (unsigned long long)(ctx->dsp_va_mapped_bytes >> 20));
     return AEE_SUCCESS;
 }
-
 AEEResult ggml_htp_unregister_rpcmem_segment(remote_handle64 h, uint32_t slot) {
     struct dsp_context * ctx = (struct dsp_context *)h;
     if (!ctx || slot == 0 || slot >= DSP_RPCMEM_MAX_SEGMENTS ||
@@ -1988,6 +2025,7 @@ AEEResult ggml_htp_unregister_rpcmem_segment(remote_handle64 h, uint32_t slot) {
     ctx->rpc_segments[slot].size = 0;
     ctx->rpc_segments[slot].fd = -1;
     ctx->rpc_segments[slot].last_use = 0;
+    ctx->rpc_segments[slot].pinned = 0;
     return AEE_SUCCESS;
 }
 
@@ -2007,7 +2045,7 @@ static bool dsp_va_prepare_op(const uint8_t needed[DSP_RPCMEM_MAX_SEGMENTS]) {
             uint32_t victim = 0;
             uint32_t oldest = UINT32_MAX;
             for (uint32_t j = 1; j < DSP_RPCMEM_MAX_SEGMENTS; j++) {
-                if (!needed[j] && ctx->rpc_segments[j].base &&
+                if (!needed[j] && !ctx->rpc_segments[j].pinned && ctx->rpc_segments[j].base &&
                     ctx->rpc_segments[j].last_use <= oldest) {
                     oldest = ctx->rpc_segments[j].last_use;
                     victim = j;
@@ -2029,7 +2067,7 @@ static bool dsp_va_prepare_op(const uint8_t needed[DSP_RPCMEM_MAX_SEGMENTS]) {
             va = NULL;
             if (attempt == 0) {
                 for (uint32_t j = 1; j < DSP_RPCMEM_MAX_SEGMENTS; j++) {
-                    if (!needed[j] && ctx->rpc_segments[j].base &&
+                    if (!needed[j] && !ctx->rpc_segments[j].pinned && ctx->rpc_segments[j].base &&
                         !dsp_va_unmap_slot(ctx, j)) return false;
                 }
             }
@@ -2233,8 +2271,9 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
             const hex_op_desc * op = &ops[i];
             for (int d = 0; d < HTP_OP_MAX_OUTPUTS; d++) {
                 const int32_t ti = op->dst_idx[d];
-                if (ti >= 0 && tens[ti].segment_id != 0) {
-                    GGMLHEXAGON_LOG_ERROR("[DSP-VA] op=%u dst[%d] tensor=%d uses evictable segment=%u; writable segment unsupported",
+                if (ti >= 0 && tens[ti].segment_id != 0 &&
+                    !g_dsp_ctx->rpc_segments[tens[ti].segment_id].pinned) {
+                    GGMLHEXAGON_LOG_ERROR("[DSP-VA] op=%u dst[%d] tensor=%d writes evictable weight segment=%u",
                                           i, d, ti, tens[ti].segment_id);
                     return AEE_EBADPARM;
                 }
