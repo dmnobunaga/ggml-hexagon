@@ -2179,8 +2179,11 @@ static uint32_t ggmlhexagon_rpc_segment_allocate(ggml_backend_hexagon_context * 
         rpcmem_free(base);
         return 0;
     }
+    // Pre-reserved model weights are lazily mapped; new runtime buffers
+    // can contain writable activations/KV and must remain pinned in DSP VA.
+    const uint32_t pinned = (ctx->dsp_va_window_mb && !reserved) ? 1u : 0u;
     err = ggml_htp_register_rpcmem_segment(ctx->ggmlop_handle, slot, (uint32_t)fd,
-                                            (uint32_t)map_size, (uint32_t)(map_size >> 32));
+                                            (uint32_t)map_size, (uint32_t)(map_size >> 32), pinned);
     if (err != AEE_SUCCESS) {
         GGMLHEXAGON_LOG_ERROR("[RPC-SEG] DSP registration failed slot=%u requested=%.2f MiB mapped=%.2f MiB err=0x%x",
                               slot, (double)size / SIZE_IN_MB, (double)map_size / SIZE_IN_MB, err);
@@ -2197,8 +2200,8 @@ static uint32_t ggmlhexagon_rpc_segment_allocate(ggml_backend_hexagon_context * 
     ctx->rpc_segments[slot] = {base, map_size, fd, size, reserved, true, true};
     ggml_mem_account_pool_create(base, "HTP_RPCMEM_SEGMENT", map_size);
     ggml_mem_account_mapping_change(base, +1);
-    GGMLHEXAGON_LOG_ALWAYS("[RPC-SEG] mapped slot=%u size=%.2f MiB requested=%zu reserved=%d",
-                            slot, (double)map_size / SIZE_IN_MB, size, (int)reserved);
+    GGMLHEXAGON_LOG_ALWAYS("[RPC-SEG] mapped slot=%u size=%.2f MiB requested=%zu reserved=%d pinned=%u",
+                            slot, (double)map_size / SIZE_IN_MB, size, (int)reserved, pinned);
     return slot;
 }
 
