@@ -48,6 +48,28 @@ The FastRPC IDL `register_rpcmem_segment` signature changed to include
 Run each condition in a **new process**. Keep the same model, `-t`, `-fa`,
 `--ubatch-size`, cooling state, and repeated benchmark settings.
 
+### Exact-layout adaptive offload
+
+The adaptive planner first reserves the **exact requested layer layout**.
+If all weight segments register successfully, the requested offload is used
+immediately (e.g. `effective_ngl=36` and `registered_prefix=4/4`).
+There is no intermediate binary search or repeated remapping on this path.
+
+If the full plan only partially registers, the planner rolls it back and
+tries smaller `ngl` values in descending order, reserving each candidate's
+**own** layout transactionally. Segment feasibility is not assumed monotonic
+across `ngl`. Unhealthy mapping state or failed rollback aborts the load.
+
+`GGML_HEXAGON_ADAPTIVE_CANDIDATE_RETRY` is obsolete and ignored; exact-layout
+selection is now the default. Diagnostics report `adaptive_strategy=exact-full`
+or `adaptive_strategy=exact-descending`.
+
+Regression checks (on-device): verify exact-full chooses all 36 layers for
+Gemma 4 E2B Q4_0 with four segments, verify the fallback with an oversized
+model, and verify healthy rollback after a rejected candidate. Perform
+VA-window ON/OFF runs with the same effective `ngl`. Automated on-device
+validation is still required for this branch.
+
 Stable baseline (current FastRPC, no DSP window):
 ```sh
 unset GGML_HEXAGON_DSP_VA_WINDOW_MB
@@ -55,7 +77,6 @@ export GGML_HEXAGON_SEGMENTED_RPCMEM=1
 export GGML_HEXAGON_ADAPTIVE_OFFLOAD=1
 export GGML_HEXAGON_SEGMENT_MB=512
 export GGML_HEXAGON_MEMORY_RESERVE_MB=1024
-export GGML_HEXAGON_ADAPTIVE_CANDIDATE_RETRY=1
 ./llama-bench -t 6 --poll 1000 -ngl 15 -fa 1 --ubatch-size 128 -p 128 -n 128 -r 3 -m /sdcard/Spark-X2.5-4B.gguf
 ```
 
