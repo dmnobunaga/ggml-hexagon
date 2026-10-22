@@ -456,14 +456,12 @@ static llama_model * llama_load_adaptive_htp(
         const std::string & path_model, std::vector<std::string> & splits,
         FILE * file, llama_model_params & params) {
     using reserve_prefix_fn = size_t (*)(ggml_backend_dev_t, const size_t *, size_t);
-    using can_fit_fn = bool (*)(ggml_backend_dev_t, const size_t *, size_t);
     using health_fn = bool (*)(ggml_backend_dev_t);
     using rollback_fn = bool (*)(ggml_backend_dev_t);
     using segment_stats_fn = void (*)(ggml_backend_dev_t, size_t *, size_t *, size_t *, size_t *);
     using segment_at_fn = bool (*)(ggml_backend_dev_t, size_t, uint32_t *, size_t *, size_t *);
     ggml_backend_dev_t htp = nullptr;
     reserve_prefix_fn reserve_prefix = nullptr;
-    can_fit_fn can_fit = nullptr;
     health_fn healthy = nullptr;
     rollback_fn rollback = nullptr;
     segment_stats_fn segment_stats = nullptr;
@@ -479,13 +477,12 @@ static llama_model * llama_load_adaptive_htp(
         }
         htp = dev;
         reserve_prefix = reinterpret_cast<reserve_prefix_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_reserve_prefix"));
-        can_fit = reinterpret_cast<can_fit_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_pending_can_fit"));
         healthy = reinterpret_cast<health_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_mapping_healthy"));
         rollback = reinterpret_cast<rollback_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_rollback_segments"));
         segment_stats = reinterpret_cast<segment_stats_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_segment_stats"));
         segment_at = reinterpret_cast<segment_at_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_segment_at"));
     }
-    if (!htp || !reserve_prefix || !can_fit || !healthy || !rollback || !segment_stats || !segment_at) {
+    if (!htp || !reserve_prefix || !healthy || !rollback || !segment_stats || !segment_at) {
         LLAMA_LOG_ERROR("[HTP-OFFLOAD] transactional HTP reservation interface unavailable\n");
         return nullptr;
     }
@@ -517,11 +514,10 @@ static llama_model * llama_load_adaptive_htp(
         std::unique_ptr<llama_model> upper_probe = std::move(initial);
         LLAMA_LOG_INFO("[HTP-OFFLOAD] requested=%d; DSP mapping drives effective_ngl; RAM protected by per-segment headroom\n",
                        requested);
-        const char * retry_env = std::getenv("GGML_HEXAGON_ADAPTIVE_CANDIDATE_RETRY");
-        const bool candidate_retry = retry_env && std::strcmp(retry_env, "1") == 0;
         std::vector<size_t> requested_chunks;
         size_t mapped = 0;
         int lo = 0;
+        const char * strategy = "exact-full";
 
         auto collect_chunks = [&](const llama_model & probe, std::vector<size_t> & sizes) -> bool {
             for (const auto & plan : probe.htp_weight_plans) {
@@ -531,95 +527,74 @@ static llama_model * llama_load_adaptive_htp(
             return true;
         };
 
-        if (candidate_retry) {
-            // A prefix of the requested model's segments does not necessarily fit
-            // a smaller candidate's tensor layout. Allocate each candidate's exact plan.
-            upper_probe.reset();
-            int hi = upper;
-            std::fprintf(stderr, "[HTP-OFFLOAD] strategy=candidate-retry (transactional per-ngl DSP mappings)\n");
-            while (lo < hi) {
-                const int mid = lo + (hi - lo + 1) / 2;
-                auto probe = make_probe(mid);
-                if (!probe) {
-                    rollback(htp);
-                    return nullptr;
-                }
-                std::vector<size_t> sizes;
-                if (!collect_chunks(*probe, sizes)) {
-                    rollback(htp);
-                    return nullptr;
-                }
-                probe.reset();
-                const size_t trial_mapped = sizes.empty() ? 0 : reserve_prefix(htp, sizes.data(), sizes.size());
-                const bool trial_healthy = healthy(htp);
-                // Never retain a failed candidate's layout for subsequent trials.
-                const bool released = rollback(htp);
-                if (!trial_healthy || !released || !healthy(htp)) {
-                    LLAMA_LOG_ERROR("[HTP-OFFLOAD] candidate %d: DSP rollback/registration state unsafe; aborting\n", mid);
-                    return nullptr;
-                }
-                const bool fit = trial_mapped == sizes.size();
-                std::fprintf(stderr, "[HTP-OFFLOAD] trial_ngl=%d mapped=%zu/%zu result=%s\n",
-                             mid, trial_mapped, sizes.size(), fit ? "FIT" : "REJECT");
-                if (fit) {
-                    lo = mid;
-                } else {
-                    hi = mid - 1;
-                }
-            }
-            if (lo > 0) {
-                auto selected = make_probe(lo);
-                if (!selected || !collect_chunks(*selected, requested_chunks)) {
-                    rollback(htp);
-                    return nullptr;
-                }
-                selected.reset();
-                mapped = requested_chunks.empty() ? 0 :
-                         reserve_prefix(htp, requested_chunks.data(), requested_chunks.size());
-                if (!healthy(htp) || mapped != requested_chunks.size()) {
-                    LLAMA_LOG_ERROR("[HTP-OFFLOAD] selected candidate %d could not be remapped consistently\n", lo);
-                    rollback(htp);
-                    return nullptr;
-                }
-            }
-            std::fprintf(stderr, "[HTP-OFFLOAD] candidate-retry selected_ngl=%d mapped=%zu/%zu\n",
+        // Try the requested model's exact segment layout first. The previous
+        // requested-prefix strategy could reserve every segment and still select
+        // fewer layers: smaller ngl plans may have incompatible segment layouts.
+        if (!collect_chunks(*upper_probe, requested_chunks)) return nullptr;
+        upper_probe.reset();
+        mapped = requested_chunks.empty() ? 0 :
+                 reserve_prefix(htp, requested_chunks.data(), requested_chunks.size());
+        if (!healthy(htp)) {
+            LLAMA_LOG_ERROR("[HTP-OFFLOAD] full-plan DSP mapping unhealthy; aborting\n");
+            rollback(htp);
+            return nullptr;
+        }
+
+        if (mapped == requested_chunks.size()) {
+            lo = upper;
+            std::fprintf(stderr, "[HTP-OFFLOAD] strategy=exact-full selected_ngl=%d mapped=%zu/%zu\n",
                          lo, mapped, requested_chunks.size());
         } else {
-            if (!collect_chunks(*upper_probe, requested_chunks)) return nullptr;
-            upper_probe.reset();
-            if (!requested_chunks.empty()) {
-                mapped = reserve_prefix(htp, requested_chunks.data(), requested_chunks.size());
-                if (!healthy(htp)) {
-                    LLAMA_LOG_ERROR("[HTP-OFFLOAD] DSP mapping teardown failed; refusing further allocations\n");
-                    rollback(htp);
-                    return nullptr;
-                }
+            // A partial reservation cannot be reused for another ngl: the
+            // per-segment capacities and the candidate's layout may differ.
+            if (!rollback(htp) || !healthy(htp)) {
+                LLAMA_LOG_ERROR("[HTP-OFFLOAD] failed to roll back partial full-plan mapping\n");
+                return nullptr;
             }
-            LLAMA_LOG_INFO("[HTP-OFFLOAD] mapped=%zu/%zu weight segments; selecting layers without remapping\n",
-                           mapped, requested_chunks.size());
-            int hi = upper;
-            while (lo < hi) {
-                const int mid = lo + (hi - lo + 1) / 2;
-                auto probe = make_probe(mid);
-                if (!probe) {
-                    rollback(htp);
-                    return nullptr;
-                }
+            mapped = 0;
+            requested_chunks.clear();
+            strategy = "exact-descending";
+            std::fprintf(stderr, "[HTP-OFFLOAD] strategy=exact-descending (transactional per-ngl DSP mappings)\n");
+
+            // Exact-layout feasibility is not necessarily monotonic because
+            // segment packing varies by ngl. Do not binary-search on FIT/REJECT.
+            for (int candidate = upper - 1; candidate >= 1; --candidate) {
+                auto probe = make_probe(candidate);
+                if (!probe) return nullptr;
+
                 std::vector<size_t> sizes;
-                if (!collect_chunks(*probe, sizes)) {
+                if (!collect_chunks(*probe, sizes)) return nullptr;
+                probe.reset();
+
+                const size_t accepted = sizes.empty() ? 0 :
+                                        reserve_prefix(htp, sizes.data(), sizes.size());
+                const bool trial_healthy = healthy(htp);
+                const bool fits = trial_healthy && accepted == sizes.size();
+                std::fprintf(stderr, "[HTP-OFFLOAD] trial_ngl=%d mapped=%zu/%zu result=%s\n",
+                             candidate, accepted, sizes.size(), fits ? "FIT" : "REJECT");
+
+                if (!trial_healthy) {
+                    LLAMA_LOG_ERROR("[HTP-OFFLOAD] candidate %d: DSP mapping unhealthy; aborting\n", candidate);
                     rollback(htp);
                     return nullptr;
                 }
-                if (can_fit(htp, sizes.data(), sizes.size())) {
-                    lo = mid;
-                } else {
-                    hi = mid - 1;
+                if (fits) {
+                    lo = candidate;
+                    mapped = accepted;
+                    requested_chunks = std::move(sizes);
+                    break;
+                }
+                if (!rollback(htp) || !healthy(htp)) {
+                    LLAMA_LOG_ERROR("[HTP-OFFLOAD] candidate %d: DSP rollback failed; aborting\n", candidate);
+                    return nullptr;
                 }
             }
+            std::fprintf(stderr, "[HTP-OFFLOAD] exact-descending selected_ngl=%d mapped=%zu/%zu\n",
+                         lo, mapped, requested_chunks.size());
         }
         const auto memory_mapped = llama_htp_read_memory();
         params.n_gpu_layers = lo;
-        if (lo == 0 && !rollback(htp)) return nullptr;
+        if (lo == 0 && (!rollback(htp) || !healthy(htp))) return nullptr;
 
         LLAMA_LOG_INFO("[HTP-OFFLOAD] requested=%d effective_ngl=%d\n", requested, lo);
         const auto [status, loaded] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud,
@@ -645,7 +620,7 @@ static llama_model * llama_load_adaptive_htp(
         std::fprintf(stderr, "[HTP-OFFLOAD]   requested_ngl            = %d (clamped=%d)\n", original_ngl, requested);
         std::fprintf(stderr, "[HTP-OFFLOAD]   segment_chunk_cap        = %s MiB (soft target; standalone tensors may be larger)\n",
                      std::getenv("GGML_HEXAGON_SEGMENT_MB") ? std::getenv("GGML_HEXAGON_SEGMENT_MB") : "1024");
-        std::fprintf(stderr, "[HTP-OFFLOAD]   adaptive_strategy         = %s\n", candidate_retry ? "candidate-retry" : "requested-prefix");
+        std::fprintf(stderr, "[HTP-OFFLOAD]   adaptive_strategy         = %s\n", strategy);
         std::fprintf(stderr, "[HTP-OFFLOAD]   dsp_va_window            = %s MiB (%s)\n",
                      std::getenv("GGML_HEXAGON_DSP_VA_WINDOW_MB") ? std::getenv("GGML_HEXAGON_DSP_VA_WINDOW_MB") : "0",
                      std::getenv("GGML_HEXAGON_DSP_VA_WINDOW_MB") ? "experimental" : "disabled");
