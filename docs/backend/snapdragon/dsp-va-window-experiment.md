@@ -173,3 +173,51 @@ performance winner has been established.
 5.24-GiB weight allocation and active weight remapping inside a 2.5-GiB
 DSP VA window. They do **not** prove all weights fit in DSP address
 space simultaneously, nor that the close error is harmless.
+
+## Verified AUTO load-mode performance fix — 2026-10-24
+
+Device: Snapdragon 8 Elite Gen 5, HTP v81. Model: Gemma 4 E2B Q4_0,
+2.82 GiB GGUF, 36/36 effective HTP layers, four DSP weight segments
+(1345.42 MiB mapped), workspace 256 MiB, DSP VA window OFF.
+Benchmarks use `-t 6 --poll 1000 -ngl 99 -fa 1 --ubatch-size 1024
+-p 500,800,1024 -n 128 -r 3`.
+
+An A/B at build `1f4b81c01` isolated a significant performance regression
+to the load-mode difference: AUTO had 1756 MiB file-backed CPU weights,
+while explicit `-lm none` allocated the same 1756 MiB as anonymous CPU
+weights. No change to the effective offload or DSP graph was needed.
+
+| Test (t/s, mean ± reported variation) | AUTO before fix | explicit NONE before fix | AUTO after fix |
+| --- | ---: | ---: | ---: |
+| pp500 | 844.50 ± 247.12 | 1717.72 ± 59.71 | **1725.79 ± 4.78** |
+| pp800 | 857.06 ± 83.97 | 1547.03 ± 78.46 | **1563.38 ± 55.53** |
+| pp1024 | 1140.98 ± 94.48 | 1657.28 ± 116.03 | **1566.28 ± 13.20** |
+| tg128 | 27.40 ± 0.95 | 33.66 ± 0.35 | **34.72 ± 0.08** |
+
+Fix `100ae215015ade2890b243d1fbfee6ead00aea9e`
+(`fix/htp-auto-load-mode`): AUTO again honors backend
+`mmap_support=false` on HTP; explicit `-lm mmap` remains available.
+The fixed AUTO run is build `100ae2150` (12488), measured by the device
+operator, not CI. Measured CPU-weight accounting: mmap 0.00 MiB,
+anonymous 1756.00 MiB; average AP graph overhead 1.467 ms vs 5.956 ms
+in pre-fix AUTO; DSP graph nodes 1498 and HMX coverage 73.4% in both.
+
+**Scope of conclusion:** the controlled load-mode A/B strongly identifies
+the memory-loading policy as the source of the regression, but does not
+separately measure major page faults. Historical PR #85 speed numbers were
+recorded with a different backend version, so are not an apples-to-apples
+benchmark of this code change. Exact-descending fallback and large BF16
+behavior on the new AUTO policy are not yet verified.
+
+**Memory safety:** anonymous CPU weights increase resident demand.
+Fixed AUTO reported `MemAvailable_start=4855.06 MiB`,
+`MemAvailable_loaded=2206.92 MiB`, and `SwapFree` declined by ~988 MiB
+during model loading, while process `VmSwap_loaded=0`. Do not infer
+that the process itself used swap from the system-wide decline.
+Do not use `GGML_MEM_GUARD_WARN_ONLY=1` for risky BF16 benchmarks.
+Explicit `-lm mmap` must be used for the initial large-model checks.
+
+Next validation: use a small-model, opt-in synthetic full-plan rejection
+to exercise exact-descending rollback and per-candidate layouts safely;
+then verify Spark-X2.5-4B BF16 with explicit mmap, a low fixed ngl and
+memory headroom before any higher-layer or VA-window trials.
