@@ -540,7 +540,16 @@ static llama_model * llama_load_adaptive_htp(
             return nullptr;
         }
 
-        if (mapped == requested_chunks.size()) {
+        // Opt-in test hook: exercise transactional descending with a healthy
+        // full reservation instead of provoking a real DSP allocation failure.
+        const char * force_env = std::getenv("GGML_HEXAGON_TEST_FORCE_DESCENDING");
+        const bool force_descending = force_env && std::strcmp(force_env, "1") == 0 &&
+                                      mapped == requested_chunks.size() && upper > 1;
+        if (force_descending) {
+            std::fprintf(stderr, "[HTP-OFFLOAD] TEST ONLY: forcing exact-descending after healthy full-plan reservation\\n");
+        }
+
+        if (mapped == requested_chunks.size() && !force_descending) {
             lo = upper;
             std::fprintf(stderr, "[HTP-OFFLOAD] strategy=exact-full selected_ngl=%d mapped=%zu/%zu\n",
                          lo, mapped, requested_chunks.size());
