@@ -546,7 +546,7 @@ static llama_model * llama_load_adaptive_htp(
         const bool force_descending = force_env && std::strcmp(force_env, "1") == 0 &&
                                       mapped == requested_chunks.size() && upper > 1;
         if (force_descending) {
-            std::fprintf(stderr, "[HTP-OFFLOAD] TEST ONLY: forcing exact-descending after healthy full-plan reservation\\n");
+            std::fprintf(stderr, "[HTP-OFFLOAD] TEST ONLY: forcing exact-descending after healthy full-plan reservation\n");
         }
 
         if (mapped == requested_chunks.size() && !force_descending) {
