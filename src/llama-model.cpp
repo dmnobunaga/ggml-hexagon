@@ -1606,9 +1606,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(dev.dev, &props);
-            const char * dev_name = ggml_backend_dev_name(dev.dev);
-            const bool is_htp = dev_name && std::strncmp(dev_name, "HTP", 3) == 0;
-            if (!props.caps.mmap_support && !(adaptive_htp && is_htp)) {
+            if (!props.caps.mmap_support) {
                 ml.use_mmap = false;
                 break;
             }
@@ -1616,7 +1614,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (adaptive_htp && ml.use_mmap) {
-        LLAMA_LOG_INFO("[HTP-OFFLOAD] preserving CPU file mmap with HTP staging buffers\n");
+        LLAMA_LOG_INFO("[HTP-OFFLOAD] using CPU file mmap with HTP staging buffers\n");
     }
 
     // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
