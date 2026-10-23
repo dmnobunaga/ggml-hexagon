@@ -221,3 +221,41 @@ Next validation: use a small-model, opt-in synthetic full-plan rejection
 to exercise exact-descending rollback and per-candidate layouts safely;
 then verify Spark-X2.5-4B BF16 with explicit mmap, a low fixed ngl and
 memory headroom before any higher-layer or VA-window trials.
+
+### Controlled exact-descending smoke test (experiment only)
+
+Branch `experiment/htp-descending-validation` introduces
+`GGML_HEXAGON_TEST_FORCE_DESCENDING=1`. After a **successful, healthy**
+requested-plan reservation, the hook intentionally rolls it back and takes
+the exact-descending path. It does not simulate partial DSP allocation or
+unhealthy mapping and is disabled by default. This isolates fallback
+control flow without deliberately exhausting RPCMEM.
+
+Use Gemma 4 E2B Q4_0 and the same matched host/DSP binaries (HTP v81):
+
+```sh
+export LD_LIBRARY_PATH=/data/local/tmp
+export GGML_HEXAGON_SEGMENTED_RPCMEM=1
+export GGML_HEXAGON_ADAPTIVE_OFFLOAD=1
+export GGML_HEXAGON_SEGMENT_MB=512
+export GGML_HEXAGON_MEMORY_RESERVE_MB=1536
+export GGML_HEXAGON_TEST_FORCE_DESCENDING=1
+unset GGML_HEXAGON_DSP_VA_WINDOW_MB GGML_MEM_GUARD_WARN_ONLY
+./llama-bench -t 6 --poll 1000 -ngl 99 -fa 1 --ubatch-size 128 \
+  -p 16 -n 4 -r 1 -lm auto -m /sdcard/gemma-4-E2B-it-Q4_0.gguf
+```
+
+Expected: `TEST ONLY: forcing exact-descending`,
+`strategy=exact-descending`, `trial_ngl=35 ... result=FIT`,
+`effective_ngl=35` (assuming 35-layer layout registers), and PP/TG
+complete. If any rollback/mapping-health error occurs, stop immediately.
+Do not present this synthetic test as confirmation of real partial DSP
+mapping failure recovery.
+
+Next, on a separate device run with sufficient free memory, test Spark
+BF16 starting at fixed `-ngl 15`, **explicit** `-lm mmap` and short
+`-p 16 -n 4 -r 1`. Measure `MemAvailable`/`SwapFree` before attempting
+higher ngl values or the optional 2560-MiB VA window. Leave memory guard
+enabled, never force `GGML_MEM_GUARD_WARN_ONLY=1`; the guard checks
+preflight accounting but does not guarantee protection against all
+system-wide memory pressure and Android OOM.
