@@ -864,3 +864,34 @@ Then alternate 512/1024 under fixed reserve=1536, VA=3072
 with matched workload and guard enabled; compare maps/evictions
 per completed DSP batch and cumulative transition timing before
 changing the allocator or eviction policy.
+
+### Verified 1024-MiB weight packing at 22 HTP layers
+
+The operator provided the actual weight-loading summary for the
+`SEGMENT_MB=1024`, `MEMORY_RESERVE_MB=1536`, VA window
+3072-MiB, Spark-X2.5-4B BF16 smoke test:
+
+- `effective_ngl=22`.
+- `dsp_weight_segments=6`, down from 11 in the 512-MiB
+  chunk-cap configuration at the same layer count (-45.5%).
+- `dsp_weight_mapped=4842.09 MiB`, effectively unchanged
+  from 4842.11 MiB at the 512-MiB chunk cap.
+- Segments: slot 1 **0.43 MiB**; slot 2 **990.16 MiB**;
+  slots 3, 4, 5 **1000.39 MiB each**;
+  slot 6 **850.32 MiB**.
+  Every mapped segment remains under the 1024-MiB hard limit.
+
+With 3072 MiB VA budget, three ~1000-MiB weight segments fit
+only if pinned activation mappings leave sufficient headroom.
+An earlier 3072-MiB profile with smaller segments observed peak
+3030 MiB. **Do not infer reduced VA miss/eviction counts from
+fewer registered segments alone:** the larger chunks decrease
+mapping granularity and can affect which weights are kept resident.
+
+The new `SEGMENT_MB=1024`, reserve 1536 PP16/TG16 result
+was 8.63/4.34 t/s, versus separate 512/1536 runs at
+5.44/4.57 and 3.86/4.22 t/s. These observations motivate
+comparing `[DSP-VA-PROF]` cumulative maps/evictions and
+transition times for the *same* PP128/TG64 workload, same
+22-layer offload, same 3072-MiB window, and both chunk caps.
+The 1024-MiB profiler pair and long benchmark remain outstanding.
