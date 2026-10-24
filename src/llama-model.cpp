@@ -1600,7 +1600,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool adaptive_htp = adaptive_env && std::strcmp(adaptive_env, "1") == 0 &&
                               segmented_env && std::strcmp(segmented_env, "1") == 0;
     const char * hybrid_env = std::getenv("GGML_HEXAGON_HYBRID_VULKAN");
-    const bool hybrid_htp = adaptive_htp && hybrid_env && std::strcmp(hybrid_env, "1") == 0;
+    const char * hybrid_opencl_env = std::getenv("GGML_HEXAGON_HYBRID_OPENCL");
+    const bool hybrid_vulkan = hybrid_env && std::strcmp(hybrid_env, "1") == 0;
+    const bool hybrid_opencl = hybrid_opencl_env && std::strcmp(hybrid_opencl_env, "1") == 0;
+    if (hybrid_vulkan && hybrid_opencl) {
+        throw std::runtime_error("[HTP-HYBRID] select only one GPU backend (Vulkan or OpenCL)");
+    }
+    const bool hybrid_htp = adaptive_htp && (hybrid_vulkan || hybrid_opencl);
+    const char * hybrid_gpu_reg = hybrid_opencl ? "OpenCL" : "Vulkan";
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
@@ -1653,18 +1660,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     ggml_backend_dev_t hybrid_htp_dev = nullptr;
-    ggml_backend_dev_t hybrid_vk_dev = nullptr;
+    ggml_backend_dev_t hybrid_gpu_dev = nullptr;
     if (hybrid_htp) {
         if (devices.size() != 2) {
-            throw std::runtime_error("[HTP-HYBRID] expected exactly HTP and Vulkan devices");
+            throw std::runtime_error(format("[HTP-HYBRID] expected exactly HTP and %s devices", hybrid_gpu_reg));
         }
         for (const auto & entry : devices) {
             const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(entry.dev));
             if (std::strcmp(name, "HTP") == 0) hybrid_htp_dev = entry.dev;
-            if (std::strcmp(name, "Vulkan") == 0) hybrid_vk_dev = entry.dev;
+            if (std::strcmp(name, hybrid_gpu_reg) == 0) hybrid_gpu_dev = entry.dev;
         }
-        if (!hybrid_htp_dev || !hybrid_vk_dev || devices[0].dev != hybrid_htp_dev) {
-            throw std::runtime_error("[HTP-HYBRID] device order must be HTP,Vulkan");
+        if (!hybrid_htp_dev || !hybrid_gpu_dev || devices[0].dev != hybrid_htp_dev) {
+            throw std::runtime_error(format("[HTP-HYBRID] device order must be HTP,%s", hybrid_gpu_reg));
         }
     }
 
@@ -1706,10 +1713,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
         if (hybrid_htp) {
-            // Preserve descending HTP layers/output; route only the CPU
-            // overflow blocks to Vulkan, keeping the HTP weight plan intact.
+            // Preserve descending HTP layers/output; route CPU overflow blocks
+            // to the chosen GPU backend, keeping the HTP weight plan intact.
             const bool on_htp = il >= i_gpu_start && (il - i_gpu_start) < act_gpu_layers;
-            ggml_backend_dev_t dev = on_htp ? hybrid_htp_dev : hybrid_vk_dev;
+            ggml_backend_dev_t dev = on_htp ? hybrid_htp_dev : hybrid_gpu_dev;
             if (!ml.no_alloc) {
                 LLAMA_LOG_INFO("[HTP-HYBRID] planned layer[%d] -> %s\n", il, ggml_backend_dev_name(dev));
             }

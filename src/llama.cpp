@@ -488,7 +488,15 @@ static llama_model * llama_load_adaptive_htp(
     }
 
     const char * hybrid_env = std::getenv("GGML_HEXAGON_HYBRID_VULKAN");
+    const char * hybrid_opencl_env = std::getenv("GGML_HEXAGON_HYBRID_OPENCL");
     const bool hybrid_vulkan = hybrid_env && std::strcmp(hybrid_env, "1") == 0;
+    const bool hybrid_opencl = hybrid_opencl_env && std::strcmp(hybrid_opencl_env, "1") == 0;
+    const bool hybrid_gpu = hybrid_vulkan || hybrid_opencl;
+    const char * hybrid_gpu_reg = hybrid_opencl ? "OpenCL" : "Vulkan";
+    if (hybrid_vulkan && hybrid_opencl) {
+        LLAMA_LOG_ERROR("[HTP-HYBRID] select only one GPU backend (Vulkan or OpenCL)\n");
+        return nullptr;
+    }
 
     auto make_probe = [&](int ngl) -> std::unique_ptr<llama_model> {
         llama_model_params p = params;
@@ -507,18 +515,19 @@ static llama_model * llama_load_adaptive_htp(
         const auto memory_start = llama_htp_read_memory();
         auto initial = make_probe(params.n_gpu_layers);
         if (!initial) return nullptr;
-        if (hybrid_vulkan) {
+        if (hybrid_gpu) {
             // The HTP backend must remain first in scheduler priority order.
             const bool valid_hybrid_devices = initial->devices.size() == 2 &&
                 initial->devices[0].dev == htp &&
                 std::strcmp(ggml_backend_reg_name(
-                    ggml_backend_dev_backend_reg(initial->devices[1].dev)), "Vulkan") == 0;
+                    ggml_backend_dev_backend_reg(initial->devices[1].dev)), hybrid_gpu_reg) == 0;
             if (!valid_hybrid_devices) {
-                LLAMA_LOG_ERROR("[HTP-HYBRID] expected precisely HTP,Vulkan; use --list-devices and -dev with these two device names\n");
+                LLAMA_LOG_ERROR("[HTP-HYBRID] expected precisely HTP,%s; use --list-devices and -dev with these two device names\n", hybrid_gpu_reg);
                 return nullptr;
             }
-            LLAMA_LOG_INFO("[HTP-HYBRID] HTP=%s Vulkan=%s; adaptive reservation applies only to HTP weights\n",
-                           ggml_backend_dev_name(htp), ggml_backend_dev_name(initial->devices[1].dev));
+            LLAMA_LOG_INFO("[HTP-HYBRID] HTP=%s %s=%s; adaptive reservation applies only to HTP weights\n",
+                           ggml_backend_dev_name(htp), hybrid_gpu_reg,
+                           ggml_backend_dev_name(initial->devices[1].dev));
         } else if (initial->devices.size() != 1 || initial->devices.front().dev != htp) {
             LLAMA_LOG_ERROR("[HTP-OFFLOAD] only one active HTP device is supported\n");
             return nullptr;
@@ -621,7 +630,7 @@ static llama_model * llama_load_adaptive_htp(
         if (lo == 0 && (!rollback(htp) || !healthy(htp))) return nullptr;
 
         LLAMA_LOG_INFO("[HTP-OFFLOAD] requested=%d effective_ngl=%d\n", requested, lo);
-        if (hybrid_vulkan) {
+        if (hybrid_gpu) {
             LLAMA_LOG_INFO("[HTP-HYBRID] selected HTP units=%d/%d (including optional output layer)\n", lo, max_layers);
         }
         const auto [status, loaded] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud,
@@ -635,7 +644,7 @@ static llama_model * llama_load_adaptive_htp(
             if (loaded) llama_model_free(loaded);
             return nullptr;
         }
-        if (hybrid_vulkan) {
+        if (hybrid_gpu) {
             for (int il = 0; il < loaded->hparams.n_layer_all; ++il) {
                 LLAMA_LOG_INFO("[HTP-HYBRID] layer[%d] planned_device=%s\n",
                                il, ggml_backend_dev_name(loaded->dev_layer(il)));
