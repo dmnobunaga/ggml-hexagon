@@ -553,3 +553,75 @@ contexts do not silently reset diagnostics. Preserve existing queue
 safety and all memory guard behavior. A window-size A/B may be
 considered afterward (current AP validation allows only 512..3072
 MiB, in multiples of 64).
+
+## Opt-in DSP VA profiler (experiment branch)
+
+On `experiment/dsp-va-profiler`, enable profiling only for the
+experimental DSP VA-window path. This instrumentation does **not**
+modify eviction selection, HMX synchronization order, mmap protection,
+memory guard, or the FastRPC IDL. It adds DSP-side timing around existing
+operations, with per-session counters stored in `dsp_context`.
+
+**Build requirements:** rebuild and install the matching FastRPC AP
+libraries/binary **and** DSP skeleton `libggml-htp-v81.so` from the
+same commit. A stale DSP skeleton does not understand profiler bit 24.
+This instrumentation has not been compiled or device-tested yet.
+
+Set these options in the Android shell before running `llama-bench`:
+
+```sh
+export LD_LIBRARY_PATH=/data/local/tmp
+export GGML_HEXAGON_SEGMENTED_RPCMEM=1
+export GGML_HEXAGON_ADAPTIVE_OFFLOAD=1
+export GGML_HEXAGON_SEGMENT_MB=512
+export GGML_HEXAGON_MEMORY_RESERVE_MB=1536
+export GGML_HEXAGON_DSP_VA_WINDOW_MB=2560
+export GGML_HEXAGON_DSP_VA_PROFILE=1
+unset GGML_HEXAGON_TEST_FORCE_DESCENDING GGML_MEM_GUARD_WARN_ONLY GGML_MEM_PREFLIGHT_ONLY
+./llama-bench -t 6 --poll 1000 -ngl 24 -fa 1 --ubatch-size 128 \
+    -p 128 -n 64 -r 3 -lm mmap -m /sdcard/Spark-X2.5-4B.gguf
+```
+
+Enable logging **before** the benchmark, in a different terminal:
+
+```sh
+adb logcat -b all -v time -s adsprpc:V ggml-hexagon:V '*:S'
+```
+
+Filter recorded logs for `[DSP-VA-PROF]`. There are two cumulative
+lines at batch 1 and every 16 completed DSP batches (plus an optional
+`close` summary if shutdown reaches `ggml_htp_close`; historical
+close error `0x2c` makes relying on that last line unsafe).
+Counters reset with each DSP context; multiple model/benchmark cases
+may create multiple contexts in one host process.
+
+Fields:
+
+| Field | Meaning |
+| --- | --- |
+| `batches` | Completed DSP execute_batch calls on that context |
+| `misses` | Per-op mapping misses that triggered suspend/prepare/wakeup |
+| `maps`, `evictions` | Existing cumulative successful weight maps and weight unmaps |
+| `active`, `peak` | Current/max dynamically tracked VA occupancy (MiB); excludes permanent workspace |
+| `mmap_calls`, `mmap_us` | HAP_mmap2 attempt count and summed execution time for on-demand weight maps, including retry attempts |
+| `munmap_calls`, `munmap_us` | HAP_munmap2 call count and summed time through VA slot unmapping |
+| `suspend_us`, `wakeup_us` | Time inside queue suspend/flush and wakeup around VA misses (not unrelated queue calls) |
+| `cache_reset_us` | Time in weight invalidation tracking reset performed on map/unmap |
+| `tensor_mark_us` | Time marking batch tensors for re-invalidation after mapping |
+| `transition_us` | Inclusive elapsed time for each mapping-miss transition; the other phase times overlap with this total |
+
+All `*_us` are DSP-side elapsed microseconds from `ggml_time_us()`.
+They exclude host-side RPC overhead, graph execution outside mapping
+transitions, weight-map *preparation* loops beyond the measured
+transition subtotal, and DSP cache invalidation work executed later
+during individual ops. `transition_us` includes time spent
+in mapping internals and should **not** be added to its component
+totals. Periodic `FARF(ALWAYS)` logging and timing reads can perturb
+benchmarks; do a matched run with the profiler flag **unset**.
+
+**A/B plan:** collect an instrumented `2560`-MiB run at `ngl=24`,
+then optionally repeat at `3072` MiB (allowed maximum) with the
+same model, `ngl`, prompts/repeats and comparable available memory.
+If system memory gets tight, do not force allocations or bypass
+memory guard. Inspect cumulative map/evict count deltas, elapsed mapping
+time, suspend time, and PP/TG before attempting LRU changes.
