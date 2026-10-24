@@ -612,9 +612,10 @@ Fields:
 
 All `*_us` are DSP-side elapsed microseconds from `ggml_time_us()`.
 They exclude host-side RPC overhead, graph execution outside mapping
-transitions, weight-map *preparation* loops beyond the measured
-transition subtotal, and DSP cache invalidation work executed later
-during individual ops. `transition_us` includes time spent
+transitions, and DSP cache invalidation work executed later during
+individual ops. The inclusive `transition_us` **does** contain the
+eviction-victim search and other work inside `dsp_va_prepare_op()`;
+`mmap_us` and `munmap_us` measure only their respective HAP calls. `transition_us` includes time spent
 in mapping internals and should **not** be added to its component
 totals. Periodic `FARF(ALWAYS)` logging and timing reads can perturb
 benchmarks; do a matched run with the profiler flag **unset**.
