@@ -2480,6 +2480,9 @@ static int ggmlhexagon_init_dsp(ggml_backend_hexagon_context * ctx) {
         //   bit  12    : power_mode valid (set when bits 8..11 carry a power_mode)
         //   bit  16    : dsp_cache_trace_bit0 (1 = emit [NPU-CACHE-TRACE-BIT0] per bit 0 decision)
         //   bit  17    : dsp_cache_trace_bit1 (1 = emit [NPU-CACHE-TRACE-BIT1] per bit 1 decision)
+        //   bits 18..23: DSP VA window in 64-MiB units (when bit 31 is set)
+        //   bit  24    : opt-in DSP VA profiler (only with DSP VA window)
+        //   bit  31    : DSP VA window valid
         // See the dsp_cache_mode and dsp_cache_trace_bit{0,1} comments in hexagon_appcfg_t.
         //
         // Note: must run AFTER ggmlhexagon_init_rpcmempool(). The NPU-side
@@ -2493,7 +2496,18 @@ static int ggmlhexagon_init_dsp(ggml_backend_hexagon_context * ctx) {
             const uint32_t trace_bit1   = (g_hexagon_appcfg.dsp_cache_trace_bit1 ? 0x20000u : 0u);
             const uint32_t window_bits = ctx->dsp_va_window_mb ?
                 (0x80000000u | ((ctx->dsp_va_window_mb / 64u) << 18)) : 0u;
-            const uint32_t payload      = trace_bit1 | trace_bit0 | power_bits | mode_bits | window_bits;
+            const char * va_profile_env = getenv("GGML_HEXAGON_DSP_VA_PROFILE");
+            const bool va_profile_requested = va_profile_env && strcmp(va_profile_env, "1") == 0;
+            const bool va_profile_enabled = va_profile_requested && ctx->dsp_va_window_mb != 0;
+            if (va_profile_requested && !ctx->dsp_va_window_mb) {
+                GGMLHEXAGON_LOG_WARN("[DSP-VA-PROF] requires GGML_HEXAGON_DSP_VA_WINDOW_MB; profiler disabled");
+            }
+            const uint32_t profile_bit = va_profile_enabled ? 0x01000000u : 0u;
+            const uint32_t payload      = trace_bit1 | trace_bit0 | power_bits | mode_bits | window_bits | profile_bit;
+            if (va_profile_enabled) {
+                GGMLHEXAGON_LOG_ALWAYS("[DSP-VA-PROF] enabled (cumulative DSP per-context counters, window=%u MiB)",
+                                       ctx->dsp_va_window_mb);
+            }
             int opts_err = ggml_htp_execute_batch(ctx->ggmlop_handle, payload, 0xFFFC);
             if (AEE_SUCCESS != opts_err) {
                 GGMLHEXAGON_LOG_WARN("set dsp_cache_mode=0x%x + power_mode=%s + dsp_cache_trace_bit0=%d + dsp_cache_trace_bit1=%d failed: 0x%x (NPU-side optimizations disabled)",
