@@ -933,3 +933,54 @@ Without `maps`, `evictions`, `transition_us` we cannot
 attribute higher TG to reduced mapping churn. Repeating 1024-MiB
 PP128/TG64 with full per-context counters and interleaving 512
 vs 1024, with unchanged VA/reserve and guard enabled, is next.
+
+### Six-segment 3072-MiB long-run DSP VA profiler snapshot
+
+Same `SEGMENT_MB=1024`, VA 3072 MiB, effective 22-layer
+Spark-X2.5-4B BF16 long-run configuration as the preceding
+PP128=8.47 t/s, TG64=4.62 t/s result. Operator supplied the
+following DSP-side cumulative `periodic` snapshot, PID 31766,
+2026-10-24 23:06:40.571:
+
+```text
+batches=64 misses=384 maps=384 evictions=380 active=2894 MiB peak=3045 MiB
+mmap_calls=446 mmap_us=34477 munmap_calls=383 munmap_us=40918
+suspend_us=1489 wakeup_us=430 cache_reset_us=39
+tensor_mark_us=25304 transition_us=104137
+```
+
+Derived from this one context: **6.00 successful maps per DSP batch**,
+**1.627 ms VA transition per batch**, **271 us per mapping-miss
+transition**, with 62 excess `mmap_calls` above successful
+`maps` (consistent with HAP mmap retries, but no explicit per-attempt
+status was logged). 380/384 successful maps required weight evictions
+in the cumulative counters. Inclusive 104.137-ms transition interval
+breakdown: mmap=34.477 ms; munmap=40.918 ms; tensor invalidation
+marking=25.304 ms; remaining queue/cache/other approximately
+3.438 ms. These component times are **included in**
+`transition_us`; they should not be added again.
+
+Previous 3072-MiB window with `SEGMENT_MB=512` had a
+**different, short** profile snapshot: `batches=16`, `maps=174`,
+`evictions=168`, `transition_us=40.881 ms`, implying
+10.875 maps/batch and 235 us/transition. The apparent
+**44.8% fewer maps/batch** with the six-segment layout is
+promising, but the two snapshots have different completed workloads
+and batch counts, so it is *not* a controlled causal comparison.
+
+**Crucial inference:** 1.627 ms/batch of measured VA transitions
+is small compared with the roughly 130-ms graph/RPC round-trip
+times sampled in a separate earlier 22-layer run. Thus direct
+map/evict transitions alone cannot explain the substantial
+observed TG64 uplift from 512- to 1024-MiB segments; possibilities
+include subsequent cache invalidation, tensor locality, DSP runtime
+variation or changing thermal/clocks. Current profile does not
+include per-op cache work after VA transitions.
+
+Next: retain 1024-MiB segments as the best observed throughput
+candidate, run interleaved 512-vs-1024 tests with the *same*
+3072-MiB window, 22 layers and PP128/TG64, capturing a matched
+last-pair snapshot for each DSP context; compare equal batch
+counts or counter deltas and record process/thermal conditions
+when possible. Avoid allocator/LRU modifications based solely
+on unlike-profile ratios.
