@@ -1671,6 +1671,29 @@ int ggml_htp_open(const char * uri, remote_handle64 * handle) {
     return 0;
 }
 
+static void dsp_va_profile_dump(const struct dsp_context * ctx, const char * tag) {
+    if (!ctx || !ctx->dsp_va_profile_enabled) return;
+    FARF(ALWAYS, "[DSP-VA-PROF] %s batches=%llu misses=%llu maps=%llu evictions=%llu active=%llu MiB peak=%llu MiB",
+         tag,
+         (unsigned long long)ctx->dsp_va_profile_batches,
+         (unsigned long long)ctx->dsp_va_profile_misses,
+         (unsigned long long)ctx->dsp_va_map_count,
+         (unsigned long long)ctx->dsp_va_evict_count,
+         (unsigned long long)(ctx->dsp_va_mapped_bytes >> 20),
+         (unsigned long long)(ctx->dsp_va_profile_peak_bytes >> 20));
+    FARF(ALWAYS, "[DSP-VA-PROF] %s mmap_calls=%llu mmap_us=%llu munmap_calls=%llu munmap_us=%llu suspend_us=%llu wakeup_us=%llu cache_reset_us=%llu tensor_mark_us=%llu transition_us=%llu",
+         tag,
+         (unsigned long long)ctx->dsp_va_profile_map_calls,
+         (unsigned long long)ctx->dsp_va_profile_map_us,
+         (unsigned long long)ctx->dsp_va_profile_unmap_calls,
+         (unsigned long long)ctx->dsp_va_profile_unmap_us,
+         (unsigned long long)ctx->dsp_va_profile_suspend_us,
+         (unsigned long long)ctx->dsp_va_profile_wakeup_us,
+         (unsigned long long)ctx->dsp_va_profile_cache_reset_us,
+         (unsigned long long)ctx->dsp_va_profile_tensor_mark_us,
+         (unsigned long long)ctx->dsp_va_profile_transition_us);
+}
+
 int ggml_htp_close(remote_handle64 handle) {
     struct dsp_context * ctx = (struct dsp_context *)handle;
     FARF(ALWAYS, "[CLOSE-DIAG] DSP close enter handle=%p", (void *)(uintptr_t)handle);
@@ -1679,6 +1702,7 @@ int ggml_htp_close(remote_handle64 handle) {
         return 0;
     }
     g_dsp_ctx = ctx;
+    dsp_va_profile_dump(ctx, "close");
     for (uint32_t slot = 1; slot < DSP_RPCMEM_MAX_SEGMENTS; slot++) {
         if (!ctx->rpc_segments[slot].base) continue;
 #if __HVX_ARCH__ > 73
@@ -1946,11 +1970,16 @@ AEEResult ggml_htp_register_rpcmem(remote_handle64 h, uint32_t ion_fd, uint32_t 
 
 static bool dsp_va_unmap_slot(struct dsp_context * ctx, uint32_t slot) {
     if (!ctx->rpc_segments[slot].base) return true;
+    const int64_t unmap_t0 = ctx->dsp_va_profile_enabled ? ggml_time_us() : 0;
 #if __HVX_ARCH__ > 73
     int err = HAP_munmap2(ctx->rpc_segments[slot].base, ctx->rpc_segments[slot].size);
 #else
     int err = HAP_munmap(ctx->rpc_segments[slot].base, ctx->rpc_segments[slot].size);
 #endif
+    if (ctx->dsp_va_profile_enabled) {
+        ctx->dsp_va_profile_unmap_us += (uint64_t)(ggml_time_us() - unmap_t0);
+        ctx->dsp_va_profile_unmap_calls++;
+    }
     if (err != 0) {
         FARF(ERROR, "[DSP-VA] unmap failed slot=%u err=%d", slot, err);
         return false;
@@ -1959,7 +1988,11 @@ static bool dsp_va_unmap_slot(struct dsp_context * ctx, uint32_t slot) {
     if (ctx->dsp_va_window_mb) {
         ctx->dsp_va_mapped_bytes -= ctx->rpc_segments[slot].size;
         if (!ctx->rpc_segments[slot].pinned) ctx->dsp_va_evict_count++;
+        const int64_t reset_t0 = ctx->dsp_va_profile_enabled ? ggml_time_us() : 0;
         weight_inval_reset_all();
+        if (ctx->dsp_va_profile_enabled) {
+            ctx->dsp_va_profile_cache_reset_us += (uint64_t)(ggml_time_us() - reset_t0);
+        }
     }
     return true;
 }
@@ -2019,6 +2052,9 @@ AEEResult ggml_htp_register_rpcmem_segment(remote_handle64 h, uint32_t slot, uin
     ctx->rpc_segments[slot].last_use = 0;
     ctx->rpc_segments[slot].pinned = pin_runtime ? 1u : 0u;
     if (pin_runtime) ctx->dsp_va_mapped_bytes += size;
+    if (ctx->dsp_va_profile_enabled && ctx->dsp_va_mapped_bytes > ctx->dsp_va_profile_peak_bytes) {
+        ctx->dsp_va_profile_peak_bytes = ctx->dsp_va_mapped_bytes;
+    }
     FARF(ALWAYS, "[RPC-SEG] %s slot=%u fd=%u size=%u MiB va=%p pinned=%u active=%llu MiB",
          lazy_weight ? "lazy-weight" : "eager",
          slot, ion_fd, (unsigned)(size >> 20), va, (unsigned)pin_runtime,
@@ -2067,11 +2103,16 @@ static bool dsp_va_prepare_op(const uint8_t needed[DSP_RPCMEM_MAX_SEGMENTS]) {
         }
         void * va = NULL;
         for (int attempt = 0; attempt < 2; attempt++) {
+            const int64_t map_t0 = ctx->dsp_va_profile_enabled ? ggml_time_us() : 0;
 #if __HVX_ARCH__ > 73
             va = HAP_mmap2(NULL, size, HAP_PROT_READ | HAP_PROT_WRITE, 0, ctx->rpc_segments[slot].fd, 0);
 #else
             va = HAP_mmap(NULL, size, HAP_PROT_READ | HAP_PROT_WRITE, 0, ctx->rpc_segments[slot].fd, 0);
 #endif
+            if (ctx->dsp_va_profile_enabled) {
+                ctx->dsp_va_profile_map_us += (uint64_t)(ggml_time_us() - map_t0);
+                ctx->dsp_va_profile_map_calls++;
+            }
             if (va && va != (void *)-1) break;
             va = NULL;
             if (attempt == 0) {
@@ -2089,7 +2130,14 @@ static bool dsp_va_prepare_op(const uint8_t needed[DSP_RPCMEM_MAX_SEGMENTS]) {
         ctx->rpc_segments[slot].base = va;
         ctx->dsp_va_mapped_bytes += size;
         ctx->dsp_va_map_count++;
+        if (ctx->dsp_va_profile_enabled && ctx->dsp_va_mapped_bytes > ctx->dsp_va_profile_peak_bytes) {
+            ctx->dsp_va_profile_peak_bytes = ctx->dsp_va_mapped_bytes;
+        }
+        const int64_t reset_t0 = ctx->dsp_va_profile_enabled ? ggml_time_us() : 0;
         weight_inval_reset_all();
+        if (ctx->dsp_va_profile_enabled) {
+            ctx->dsp_va_profile_cache_reset_us += (uint64_t)(ggml_time_us() - reset_t0);
+        }
         if (ctx->dsp_va_map_count <= 16 || (ctx->dsp_va_map_count % 128) == 0) {
             FARF(ALWAYS, "[DSP-VA] map slot=%u va=%p active=%llu MiB maps=%llu evictions=%llu",
                  slot, va, (unsigned long long)(ctx->dsp_va_mapped_bytes >> 20),
@@ -2166,6 +2214,10 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
         if (batch_offset & 0x80000000u) {
             g_dsp_ctx->dsp_va_window_mb = ((batch_offset >> 18) & 0x3Fu) * 64u;
             FARF(ALWAYS, "[DSP-VA] weight mapping window=%u MiB", g_dsp_ctx->dsp_va_window_mb);
+            g_dsp_ctx->dsp_va_profile_enabled = (batch_offset & 0x01000000u) != 0;
+            if (g_dsp_ctx->dsp_va_profile_enabled) {
+                FARF(ALWAYS, "[DSP-VA-PROF] enabled per-context DSP timing profile");
+            }
         }
         g_dsp_ctx->dsp_cache_trace_bit0 = (batch_offset >> 16) & 0x1u;
         g_dsp_ctx->dsp_cache_trace_bit1 = (batch_offset >> 17) & 0x1u;
