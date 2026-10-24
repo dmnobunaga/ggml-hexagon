@@ -205,6 +205,21 @@ struct dsp_context {
     uint64_t dsp_va_mapped_bytes;
     uint64_t dsp_va_map_count;
     uint64_t dsp_va_evict_count;
+    // Opt-in DSP-side VA profiling, configured via execute_batch(0xFFFC) bit 24.
+    // Counters accumulate per DSP context; not shared across llama-bench cases.
+    uint32_t dsp_va_profile_enabled;
+    uint64_t dsp_va_profile_batches;
+    uint64_t dsp_va_profile_misses;
+    uint64_t dsp_va_profile_map_calls;
+    uint64_t dsp_va_profile_unmap_calls;
+    uint64_t dsp_va_profile_map_us;
+    uint64_t dsp_va_profile_unmap_us;
+    uint64_t dsp_va_profile_suspend_us;
+    uint64_t dsp_va_profile_wakeup_us;
+    uint64_t dsp_va_profile_cache_reset_us;
+    uint64_t dsp_va_profile_tensor_mark_us;
+    uint64_t dsp_va_profile_transition_us;
+    uint64_t dsp_va_profile_peak_bytes;
 
     // DSP-side entry.c cache optimization bitmask. Pushed by AP at init via
     // execute_batch(0xFFFC) special mode (no IDL change). All three bits are
