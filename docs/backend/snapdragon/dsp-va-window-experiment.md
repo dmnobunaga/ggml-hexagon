@@ -410,3 +410,47 @@ numerical outputs vs CPU/DSPQueue, sustained inference/repeated-load
 stability, and whether swapping affected performance. Do not raise
 offload above 24 on the strength of this one run; inspect device logs
 and exercise a longer comparable workload with memory guard enabled.
+
+#### DSP VA log evidence — 24-layer weight-map eviction (2026-10-24)
+
+Operator-provided `adsprpc`/host logcat excerpt for PID `30552`,
+timestamped **14:38:52–14:39:15** local device time. This excerpt
+is from a *later session* than the previously reported benchmark
+timestamp `14:28:01`, so it cannot be used to directly attribute
+that benchmark's per-graph latency.
+
+Observed 2560-MiB opt-in DSP VA window and 256-MiB permanently mapped
+workspace. Slots 1–12 register as `lazy-weight`, `pinned=0`,
+`va=00000000`, `active=0 MiB`; slot 1 has 0.46 MiB payload
+(displayed as `size=0 MiB` in integer-rounded DSP logging).
+The large weight segment in slot 2 is 640 MiB, above the soft
+512-MiB target; this is the standalone `token_embd.weight` allocation,
+which the host explicitly reports.
+
+Runtime slots 13–15 map as `eager`, `pinned=1` (6 MiB, 17 MiB,
+8.16 MiB), initially accounting for roughly 31 MiB active DSP VA.
+Weights are then mapped on demand:
+- `map slot=7 ... active=2532 MiB maps=6 evictions=0`.
+- `map slot=8 ... active=2532 MiB maps=7 evictions=1`:
+  eviction is triggered to keep within the window.
+- `map slot=2 ... active=2272 MiB maps=12 evictions=6`.
+- `map slot=6 ... active=2032 MiB maps=16 evictions=11`.
+  Repeated maps of slots 3–6 show that evicted segments can be
+  mapped again successfully.
+
+These are **partial cumulative counters**, not run totals; earlier
+observed logging emits initial events, then reduces log frequency.
+No map/unmap error appears in the excerpt. The final rows also show
+further eager mapping of slots 13–15, with slot 15 allocated at
+2.04 MiB in that later phase; repeated slot IDs alone do not establish
+a leak or double allocation.
+
+The timestamps between nearby mapping events are often about 20 ms,
+but **logcat intervals are not measurements of pure HAP_mmap2 latency**;
+DSP computation, synchronization and logging can intervene. A future
+optimization pass should add counters and accumulated map/eviction/
+unmap/sync timings per graph or run, including mapping cache churn,
+before attributing the P9 latency increase to VA eviction. For further
+24-layer runs, inspect process-level swapping and compare matched
+`-p 128 -n 64 -r 3` workloads in new processes only when sufficient
+system memory headroom is available. Do not bypass the memory guard.
