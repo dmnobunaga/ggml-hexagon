@@ -2310,7 +2310,7 @@ static void ggmlhexagon_deinit_cdsp(ggml_backend_hexagon_context * ctx) {
     }
     // Do not re-probe capabilities after a failed DSP initialization.
     // On init failure, FastRPC's effective session domain may be invalid.
-    if (ctx->domain_id >= 0 && ctx->socinfo.soc_desc != nullptr) {
+    if (ctx->domain_id >= 0 && ctx->socinfo.htp_arch != 0) {
         ggmlhexagon_probe_dspinfo(ctx);
     }
     ggmlhexagon_dump_perf_stats(ctx);
