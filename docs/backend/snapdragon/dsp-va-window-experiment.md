@@ -895,3 +895,41 @@ comparing `[DSP-VA-PROF]` cumulative maps/evictions and
 transition times for the *same* PP128/TG64 workload, same
 22-layer offload, same 3072-MiB window, and both chunk caps.
 The 1024-MiB profiler pair and long benchmark remain outstanding.
+
+### 1024-MiB segments, 3072-MiB VA — full PP128/TG64 benchmark
+
+User-reported longer test of the same Spark-X2.5-4B BF16 model on build
+`1592c59d9`, requested `-ngl 22`, with
+`GGML_HEXAGON_SEGMENT_MB=1024`,
+`GGML_HEXAGON_DSP_VA_WINDOW_MB=3072`,
+`GGML_HEXAGON_MEMORY_RESERVE_MB=1536`,
+`GGML_HEXAGON_DSP_VA_PROFILE=1`, and `-p 128 -n 64 -r 1`:
+
+- `strategy=exact-full selected_ngl=22 mapped=6/6`,
+  `effective_ngl=22`;
+- **PP128 = 8.47 t/s; TG64 = 4.62 t/s**;
+- the earlier weight-layout summary for the same chunk cap showed six
+  slots totaling 4842.09 MiB; the long run confirmed the six-slot
+  reservation but did not separately reprint every slot size.
+
+For comparison at 3072-MiB VA with 512-MiB segments,
+the two long runs reported **PP128=8.04 / 8.38**,
+**TG64=2.75 / 3.61** t/s. Relative to their two-run means,
+this single 1024-MiB run is **+3.2% PP128 and +45.3% TG64**.
+Another run with 2560-MiB VA and 512-MiB segments, profiler ON,
+reported **PP128=8.07, TG64=3.88** t/s.
+
+Interpretation: the larger chunk cap produced the highest TG64
+among these fixed-22-layer tests. This is evidence worth testing,
+not a controlled causal conclusion: only one long run with 1024-MiB
+segments has been provided; execution/memory/thermal conditions
+can vary. Short PP16 improved strongly with the 1024-MiB chunk cap
+but the full PP128 workload only improved slightly; do not conflate
+prompt-length regimes.
+
+**Still missing:** the final DSP VA profiler pair (same context/PID,
+comparable batch counters) for this six-segment long run.
+Without `maps`, `evictions`, `transition_us` we cannot
+attribute higher TG to reduced mapping churn. Repeating 1024-MiB
+PP128/TG64 with full per-context counters and interleaving 512
+vs 1024, with unchanged VA/reserve and guard enabled, is next.
