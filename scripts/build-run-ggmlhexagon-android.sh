@@ -616,7 +616,7 @@ function build_ggml_hexagon()
         adb shell "mkdir -p '${REMOTE_PATH}'"
     fi
     dump_vars
-    if [ "${GGML_HYBRID_VULKAN:-0}" != "1" ] || [ "${CLEAN_BUILD:-0}" = "1" ]; then
+    if [[ "${CLEAN_BUILD:-0}" == "1" ]]; then
         remove_temp_dir
     fi
     rm -f ${LOCAL_BUILD_DIR}/.ab_test_runtime

@@ -15,7 +15,7 @@ With `GGML_HEXAGON_HYBRID_VULKAN=1`, select exactly **HTP first, Vulkan second**
 
 ## Android cross-build and isolated deployment
 
-Existing Android NDK, Qualcomm Hexagon SDK and LunarG SDK required on the Linux build host:
+On a Linux build host, NDK, Hexagon SDK and LunarG SDK are downloaded or reused by the existing FastRPC setup workflow:
 
 ```bash
 # Reuses the existing NDK / Hexagon SDK download and deployment pipeline:
