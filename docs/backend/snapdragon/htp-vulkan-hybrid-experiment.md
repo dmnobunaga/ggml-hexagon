@@ -33,7 +33,9 @@ Verify both devices before loading a model:
 ./scripts/build-run-ggmlhybrid-android.sh devices
 ```
 
-For the first smoke test, replace `HTP0,Vulkan0` with the names actually printed by `--list-devices`:
+**Important: device-list syntax differs across executables.** In `llama-bench`, a comma separates *independent benchmark configurations* while a slash combines devices into one configuration. Use `--device HTP0/Vulkan0` (not `HTP0,Vulkan0`). In `llama-cli` and other executables using `common/arg.cpp`, the device-list delimiter is a comma: `--device HTP0,Vulkan0`.
+
+For the first smoke test, replace `HTP0/Vulkan0` with the device names actually printed by `--list-devices`:
 
 ```bash
 adb shell '
@@ -47,7 +49,7 @@ export GGML_HEXAGON_MEMORY_RESERVE_MB=1536
 export GGML_HEXAGON_DSP_VA_WINDOW_MB=3072
 export GGML_HEXAGON_HYBRID_VULKAN=1
 export GGML_SCHED_DEBUG=2
-./llama-bench -dev HTP0,Vulkan0 -ngl 35 -t 6 --poll 1000 -fa 1 \
+./llama-bench -dev HTP0/Vulkan0 -ngl 35 -t 6 --poll 1000 -fa 1 \
   --ubatch-size 128 -p 16 -n 4 -r 1 -m /sdcard/Spark-X2.5-4B.gguf
 ' 2>&1 | tee hybrid-spark-35.log
 ```
