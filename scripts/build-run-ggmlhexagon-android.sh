@@ -443,6 +443,19 @@ function build_arm64
 
     local extra_flags="${arm_cpu_flags} ${pgo_flags}"
     local vulkan_cmake_args=()
+    local opencl_cmake_args=()
+    local opencl_enabled=OFF
+    if [ "${GGML_HYBRID_OPENCL:-0}" = "1" ]; then
+        opencl_enabled=ON
+        opencl_cmake_args=(
+            -DGGML_VULKAN=OFF
+            "-DOpenCL_INCLUDE_DIR=${NDK_TOOLCHAIN_SYSROOT_INCLUDE_PATH}"
+            "-DOpenCL_LIBRARY=${NDK_TOOLCHAIN_SYSROOT_ARM64_LIB_PATH}/libOpenCL.so"
+            -DGGML_OPENCL_USE_ADRENO_KERNELS=ON
+            -DGGML_OPENCL_EMBED_KERNELS=ON
+            -DGGML_OPENCL_TARGET_VERSION=300
+        )
+    fi
     if [ "${GGML_HYBRID_VULKAN:-0}" = "1" ]; then
         extra_flags="${extra_flags} -I${VULKAN_SDK}/include"
         vulkan_cmake_args=(
@@ -456,7 +469,7 @@ function build_arm64
 
     /bin/cp -fv ${PROJECT_ROOT_PATH}/docs/backend/snapdragon/CMakeUserPresets.json .
 
-    cmake -H. -B${LOCAL_BUILD_DIR} -DCMAKE_BUILD_TYPE=Release -DGGML_OPENMP=OFF -DGGML_OPENCL=OFF -DGGML_CCACHE=ON -DCMAKE_TOOLCHAIN_FILE=${ANDROID_NDK}/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=latest -DGGML_HEXAGON=ON -DLLAMA_CURL=OFF -DGGML_LLAMAFILE=ON -DGGML_HEXAGON_USE_MEMPOOL=ON -DHEXAGON_SDK_ROOT=${HEXAGON_SDK_PATH} -DHEXAGON_TOOLS_ROOT=${HEXAGON_TOOLS_PATH} -DCMAKE_C_FLAGS="${extra_flags}" -DCMAKE_CXX_FLAGS="${extra_flags}" -DCMAKE_VERBOSE_MAKEFILE:BOOL=${VERBOSE} "${vulkan_cmake_args[@]}" -DGGML_USE_HEXAGON=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=ON -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_SUBPROCESS=ON --preset arm64-android-snapdragon-release
+    cmake -H. -B${LOCAL_BUILD_DIR} -DCMAKE_BUILD_TYPE=Release -DGGML_OPENMP=OFF -DGGML_OPENCL=${opencl_enabled} -DGGML_CCACHE=ON -DCMAKE_TOOLCHAIN_FILE=${ANDROID_NDK}/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=latest -DGGML_HEXAGON=ON -DLLAMA_CURL=OFF -DGGML_LLAMAFILE=ON -DGGML_HEXAGON_USE_MEMPOOL=ON -DHEXAGON_SDK_ROOT=${HEXAGON_SDK_PATH} -DHEXAGON_TOOLS_ROOT=${HEXAGON_TOOLS_PATH} -DCMAKE_C_FLAGS="${extra_flags}" -DCMAKE_CXX_FLAGS="${extra_flags}" -DCMAKE_VERBOSE_MAKEFILE:BOOL=${VERBOSE} "${vulkan_cmake_args[@]}" "${opencl_cmake_args[@]}" -DGGML_USE_HEXAGON=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=ON -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_SUBPROCESS=ON --preset arm64-android-snapdragon-release
     cmake --build ${LOCAL_BUILD_DIR}
     #upload the new libggml-htp.so (mempool variant) on device side
     prepare_fastrpc_skels
@@ -467,7 +480,7 @@ function build_arm64
     commit_so_file_md5 ${LOCAL_BUILD_DIR}/bin/libggml-cpu.so
     if [ -f ${LOCAL_BUILD_DIR}/bin/libggml-hexagon.so ]; then
         commit_so_file_md5 ${LOCAL_BUILD_DIR}/bin/libggml-hexagon.so
-        if [ "${GGML_HYBRID_VULKAN:-0}" != "1" ]; then
+        if [ "${GGML_HYBRID_VULKAN:-0}" != "1" ] && [ "${GGML_HYBRID_OPENCL:-0}" != "1" ]; then
         # backup for AB testing: mempool(FastRPC) AP-side libs + DSP skels
         # libggml-hexagon.so leaks different libc++ symbols between the mempool/dspqueue
         # variants, so all transitively-linked libs (libggml, libllama, libllama-common,
@@ -611,8 +624,14 @@ function build_ggml_hexagon()
     check_and_download_ndk
     check_and_download_opencl_sdk
     check_and_download_hexagon_sdk
+    if [ "${GGML_HYBRID_VULKAN:-0}" = "1" ] && [ "${GGML_HYBRID_OPENCL:-0}" = "1" ]; then
+        echo "ERROR: choose Vulkan or OpenCL, not both" >&2
+        return 1
+    fi
     if [ "${GGML_HYBRID_VULKAN:-0}" = "1" ]; then
         check_and_download_vulkan_sdk
+    fi
+    if [ "${GGML_HYBRID_VULKAN:-0}" = "1" ] || [ "${GGML_HYBRID_OPENCL:-0}" = "1" ]; then
         adb shell "mkdir -p '${REMOTE_PATH}'"
     fi
     dump_vars
@@ -829,7 +848,11 @@ function update_ggml_libs()
         fi
         adb push "${LOCAL_BUILD_DIR}/bin/libggml-vulkan.so" "${REMOTE_PATH}/"
     fi
-    #libggml-opencl.so is optional (GGML_OPENCL=OFF by default)
+    if [ "${GGML_HYBRID_OPENCL:-0}" = "1" ] && [ ! -f "${LOCAL_BUILD_DIR}/bin/libggml-opencl.so" ]; then
+        echo "Hybrid OpenCL build missing libggml-opencl.so" >&2
+        return 1
+    fi
+    # OpenCL is optional in DSP-only builds; required by the OpenCL hybrid.
     if [ -f ${LOCAL_BUILD_DIR}/bin/libggml-opencl.so ]; then
         adb push ${LOCAL_BUILD_DIR}/bin/libggml-opencl.so          ${REMOTE_PATH}/
     fi
@@ -843,18 +866,26 @@ function update_ggml_libs()
 }
 
 
-# Push a coherent HTP + Vulkan runtime from the current build directory,
+# Push a coherent HTP + GPU runtime from the current build directory,
 # using the same helpers as the FastRPC pipeline without touching out/ab-test.
 function update_hybrid_libs()
 {
-    if [ "${GGML_HYBRID_VULKAN:-0}" != "1" ]; then
-        echo "ERROR: update_hybrid_libs requires GGML_HYBRID_VULKAN=1" >&2
+    local accelerator_lib
+    local accelerator_name
+    if [ "${GGML_HYBRID_OPENCL:-0}" = "1" ] && [ "${GGML_HYBRID_VULKAN:-0}" != "1" ]; then
+        accelerator_lib=libggml-opencl.so
+        accelerator_name=OpenCL
+    elif [ "${GGML_HYBRID_VULKAN:-0}" = "1" ] && [ "${GGML_HYBRID_OPENCL:-0}" != "1" ]; then
+        accelerator_lib=libggml-vulkan.so
+        accelerator_name=Vulkan
+    else
+        echo "ERROR: update_hybrid_libs needs exactly one of GGML_HYBRID_OPENCL=1 or GGML_HYBRID_VULKAN=1" >&2
         return 1
     fi
 
     local bin="${LOCAL_BUILD_DIR}/bin"
     local required
-    for required in libggml-base.so libggml-cpu.so libggml-hexagon.so libggml-vulkan.so \
+    for required in libggml-base.so libggml-cpu.so libggml-hexagon.so "${accelerator_lib}" \
                     libggml.so libllama.so libllama-common.so \
                     libllama-bench-impl.so libllama-completion-impl.so \
                     libllama-server-impl.so libmtmd.so; do
@@ -890,7 +921,7 @@ function update_hybrid_libs()
 
     echo "hybrid" > "${LOCAL_BUILD_DIR}/.ab_test_runtime"
     echo "hybrid" > "${LOCAL_BUILD_DIR}/.last_deployed_build_type"
-    echo "Hybrid FastRPC + Vulkan runtime updated in ${REMOTE_PATH}"
+    echo "Hybrid FastRPC + ${accelerator_name} runtime updated in ${REMOTE_PATH}"
 }
 
 
