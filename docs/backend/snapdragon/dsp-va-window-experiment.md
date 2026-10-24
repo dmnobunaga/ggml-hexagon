@@ -702,3 +702,34 @@ mmap and memory guard fixed, run the same longer
 TG slowdown depends on decode length, prompt length, model state,
 profiling, or other run conditions. Continue collecting filtered
 `[DSP-VA-PROF]` data rather than full logcat.
+
+### Controlled 22-layer PP128/TG64 profiling A/B
+
+Follow-up device tests, build `1592c59d9` (12505), same explicit
+`-ngl 22` and `effective_ngl=22`, `strategy=exact-full`
+(11/11 segments), VA 2560 MiB, explicit `-lm mmap`,
+`-p 128 -n 64 -r 1` and the same runtime options. Operator's
+loop ran profiler OFF first and ON second:
+
+| Metric | Profile OFF | Profile ON |
+| --- | ---: | ---: |
+| PP128, t/s | 8.17 | 8.07 |
+| TG64, t/s | 3.74 | 3.88 |
+| MemAvailable_loaded, MiB | 3030.09 | 3194.23 |
+| VmSwap_loaded, MiB | 29.18 | 29.21 |
+
+The measured differences were -1.2% on PP128 and +3.7% on TG64
+with profiling enabled. One repetition each cannot establish a
+statistically meaningful overhead; however, **neither run reproduced
+the severe `tg64=0.48 t/s` observed during the earlier requested
+`ngl=24` / effective `ngl=22` run.** The original anomalous
+run remains unexplained and should not be used to claim that the
+profiler or LRU alone caused a nearly nine-fold regression.
+
+Next experiment should focus on VA-window size, holding `ngl=22`
+and workload fixed: compare 2560 vs 3072 MiB with profiling ON
+and memory guard active, recording the last per-context profiler
+pair and actual `effective_ngl`. Since there is no controlled
+3072-MiB safety result yet, start with short PP16/TG16 before
+a longer benchmark. Do not infer that an enabled guard guarantees
+system-wide OOM safety.
