@@ -626,3 +626,47 @@ same model, `ngl`, prompts/repeats and comparable available memory.
 If system memory gets tight, do not force allocations or bypass
 memory guard. Inspect cumulative map/evict count deltas, elapsed mapping
 time, suspend time, and PP/TG before attempting LRU changes.
+
+### First DSP VA profile — unexpected 22-layer fallback and TG slowdown
+
+Operator run (2026-10-24, build `1592c59d9` / 12505), requested
+`-ngl 24`, experimental VA window 2560 MiB, profiler ON:
+- `effective_ngl=22`, `dsp_weight_mapped=4842.11 MiB`.
+  Requested and effective ngl differ; the full planner
+  `strategy=` / `trial_ngl=` lines have **not** yet been provided.
+- `pp128=8.15 ± 0.09 t/s`, `tg64=0.48 ± 0.01 t/s`,
+  versus the previous profiler-OFF `effective_ngl=24` run
+  `pp128=10.26 ± 0.70`, `tg64=4.20 ± 0.04 t/s`.
+  This is **not** a controlled profiler A/B: effective layer counts,
+  run state and memory headroom differ.
+- `MemAvailable_loaded=2615.27 MiB`, `VmSwap_loaded=29.13 MiB`.
+  Baseline had 2919.24 MiB and 28.83 MiB respectively.
+
+One repeated per-context snapshot under PID `14536` reports:
+`batches=96`, `misses=961`, `maps=961`,
+`evictions=955`, `active=2394 MiB`,
+`peak=2555 MiB`.
+Measured cumulative `mmap_calls=961`, `mmap_us=58290`,
+`munmap_calls=958`, `munmap_us=90524`,
+`suspend_us=3385`, `wakeup_us=1062`,
+`cache_reset_us=73`, `tensor_mark_us=92199`,
+`transition_us=249711`. The inclusive transition interval
+is ~260 us per miss across this 96-batch snapshot. This observed
+subset alone cannot account for the full ~8.75x TG throughput drop.
+
+**Logging anomaly:** the operator supplied six `periodic` log
+pairs, ~2 s apart, all with byte-identical
+`batches=96` and elapsed-time counters, despite source logic
+emitting periodic summaries after batch 1 and every 16 *completed*
+batches. Do not interpret repetitions as six independent measurements
+or forward progress; determine whether stale FARF messages were
+replayed or the profile lifecycle/logging malfunctioned.
+
+**Triage before optimization:** retrieve short planner lines
+(`strategy=`, `trial_ngl=`, `effective_ngl`, memory guard),
+then perform matched profiler ON/OFF runs with fixed
+`-ngl 22`, the same model, `-lm mmap`, VA 2560 MiB,
+short `-p 16 -n 16 -r 1`, safe memory headroom, and verified
+`effective_ngl`. Do not infer that profiled HAP operations,
+HMX suspend, cache tracking or LRU caused the regression until
+the new A/B isolates the effect. Keep the memory guard enabled.
