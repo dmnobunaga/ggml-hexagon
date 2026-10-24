@@ -362,3 +362,51 @@ not supplied* for review. This run confirms the feature permits
 eviction counts or their timing contribution. Collect mapping log
 contents and preferably repeat both modes under comparable conditions
 before drawing a performance conclusion or raising ngl to 24.
+
+#### Spark-X2.5-4B BF16 — 24 layers, VA ON 2560 MiB (2026-10-24)
+
+**PASS (short inference at 5.24 GiB registered DSP weight allocation)**.
+Device: Snapdragon 8 Elite Gen 5, HTP v81. Reported `llama-bench`
+build: `e0b1c238f` (12495). The source changes between the earlier
+`d97c0ba1b` test build and this build are documentation-only.
+Config: `-ngl 24 -lm mmap -t 6 --poll 1000 -fa 1
+--ubatch-size 128 -p 16 -n 4 -r 1`,
+`GGML_HEXAGON_DSP_VA_WINDOW_MB=2560`,
+segmented RPCMEM and adaptive planner ON, `GGML_HEXAGON_SEGMENT_MB=512`,
+`GGML_HEXAGON_MEMORY_RESERVE_MB=1536`; no test-forced descending;
+memory guard not bypassed.
+
+- `strategy=exact-full selected_ngl=24 mapped=12/12`;
+  `dsp_weight_mapped=5242.30 MiB`,
+  `dsp_weight_payload=5242.26 MiB`, workspace `256 MiB`.
+  These weight sizes are registered/mapped allocations, **not** proof
+  of simultaneous VA residency inside the 2560 MiB window.
+- `cpu_weight_mmap=3241.27 MiB`, `cpu_weight_anon=0 MiB`.
+- `pp16=9.31 t/s`, `tg4=4.08 t/s` (one repeat each);
+  at 15 layers with VA ON the same short tests gave
+  `pp16=5.50`, `tg4=3.71 t/s`. This is a configuration comparison,
+  not a statistically controlled estimate of the layer-count effect.
+- Graph stats: 811 nodes, `avg_p9=157.917 ms`,
+  `avg_graph=158.487 ms`, `avg_AP_overhead=0.570 ms`,
+  7 graph calls, 5 cache hits and 2 misses.
+- `MemAvailable_start=7636.27 MiB`,
+  `MemAvailable_mapped=2597.91 MiB`,
+  `MemAvailable_loaded=3509.18 MiB`;
+  `SwapFree_start=7778.90 MiB`,
+  `SwapFree_loaded=6211.28 MiB`, a system-wide decline of
+  1567.62 MiB. Process `VmSwap_loaded=28.40 MiB`,
+  `VmRSS_loaded=7.27 MiB` and `VmHWM_loaded=3175.82 MiB`.
+  The small final RSS and nonzero process swap merit follow-up;
+  these samples alone cannot establish where pages were reclaimed.
+
+An earlier experimental snapshot (`f308c7499`) reported
+`pp16=10.52` and `tg4=4.60 t/s` with 24 layers and VA ON, but those
+were measured in different run conditions and are not a controlled
+performance regression comparison.
+
+**Scope of result:** successful model load and PP16/TG4 execution.
+Not yet verified: DSP-VA map/eviction counter details from logcat,
+numerical outputs vs CPU/DSPQueue, sustained inference/repeated-load
+stability, and whether swapping affected performance. Do not raise
+offload above 24 on the strength of this one run; inspect device logs
+and exercise a longer comparable workload with memory guard enabled.
