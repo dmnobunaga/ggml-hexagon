@@ -151,6 +151,16 @@ void ggml_vk_print_device_fault_info(const vk_device& device) {
         return;
     }
 
+    // The Adreno Vulkan driver on Snapdragon 8 Elite Gen5 has been observed
+    // to dereference NULL inside vkGetDeviceFaultInfoEXT while reporting
+    // device loss. Do not hide the original Vulkan error with a secondary crash.
+    // This affects diagnostics only, not compute or device-loss handling.
+    if (device->vendor_id == VK_VENDOR_ID_QUALCOMM &&
+        !getenv("GGML_VK_ENABLE_ADRENO_DEVICE_FAULT_INFO")) {
+        GGML_LOG_ERROR("ggml_vulkan: skipping vkGetDeviceFaultInfoEXT on Adreno (driver SIGSEGV workaround)\n");
+        return;
+    }
+
     VkDeviceFaultCountsEXT fault_counts {};
     fault_counts.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT;
     VkResult res = device->pfn_vkGetDeviceFaultInfoEXT(device->device, &fault_counts, nullptr);
