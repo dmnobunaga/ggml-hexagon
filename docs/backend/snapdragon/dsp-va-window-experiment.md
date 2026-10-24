@@ -733,3 +733,60 @@ pair and actual `effective_ngl`. Since there is no controlled
 3072-MiB safety result yet, start with short PP16/TG16 before
 a longer benchmark. Do not infer that an enabled guard guarantees
 system-wide OOM safety.
+
+### 3072-MiB window repetitions: mixed throughput and ongoing VA churn
+
+Additional user-reported results for build `1592c59d9` (12505),
+Spark-X2.5-4B BF16, requested/effective `ngl=22`,
+3072-MiB VA window, `-lm mmap` and 128-token ubatch.
+The earlier 2560-MiB tests ran the profiler ON/OFF as indicated;
+the exact `GGML_HEXAGON_DSP_VA_PROFILE` value for **both**
+3072-MiB longer runs was not repeated in the excerpt, although the
+surrounding profiling experiment implies it was enabled.
+
+| Workload | 3072 run 1 | 3072 run 2 |
+| --- | ---: | ---: |
+| PP16 t/s | 5.44 | 3.86 |
+| TG16 t/s | 4.57 | 4.22 |
+| PP128 t/s | 8.04 | 8.38 |
+| TG64 t/s | 2.75 | 3.61 |
+
+At 3072 MiB, `pp128` is stable around 8.21 t/s mean across two
+individual runs, but TG64 ranges from 2.75 to 3.61 t/s (mean
+3.18 t/s). Previous 2560-MiB 22-layer PP128/TG64 results:
+profiler OFF 8.17/3.74 t/s and ON 8.07/3.88 t/s.
+Thus the **two observed 3072-MiB TG64 results show no persistent
+speed benefit** over the earlier 2560-MiB results; no formal causal
+window comparison is justified by this small, time-varying sample.
+
+The two reported 3072-MiB long runs had
+`MemAvailable_loaded=3076.85` and `3081.64 MiB`, and
+`VmSwap_loaded=14.52` and `29.11 MiB` respectively. The
+run with more swapped process memory generated *faster*, which
+rules out a simple one-directional inference based only on sampled
+`VmSwap_loaded`. Other runtime conditions and swap traffic remain
+unknown.
+
+Separate logcat for a repeated short 3072-MiB run, PID `21991`,
+showed per-context `[DSP-VA-PROF]` at
+`batches=1 maps=11 evictions=4`, then
+`batches=16 misses=174 maps=174 evictions=168 active=2370 MiB
+peak=3030 MiB`; time counters:
+`mmap_calls=187 mmap_us=12721`,
+`munmap_calls=171 munmap_us=15724`,
+`suspend_us=583 wakeup_us=195`,
+`cache_reset_us=15 tensor_mark_us=11099`,
+`transition_us=40881`. The 13 extra `mmap_calls` over successful
+maps are consistent with retry attempts in the current code, but
+there is no per-call failure trace to prove exactly which attempts
+failed or why. The 3072 window therefore did **not** eliminate
+map/eviction churn in that short run.
+
+These per-context profile counters are from a **short** run and
+must not be combined or directly normalized against previous
+2560-MiB 96-batch samples from different workloads. Next diagnostic:
+capture a final in-context profiler pair and throughput from a
+*matched* PP128/TG64 run with the same effective NGL and profiler
+setting at both window sizes, tracking temperature, clocks, and
+memory state if the unexpected TG variability persists. Keep
+memory guard active.
