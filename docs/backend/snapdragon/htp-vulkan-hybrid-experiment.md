@@ -20,10 +20,12 @@ On a Linux build host, NDK, Hexagon SDK and LunarG SDK are downloaded or reused 
 ```bash
 # Reuses the existing NDK / Hexagon SDK download and deployment pipeline:
 ./scripts/build-run-ggmlhybrid-android.sh build
+# After rebuilding manually, redeploy without recompiling:
+./scripts/build-run-ggmlhybrid-android.sh update_fastrpc_libs
 ./scripts/build-run-ggmlhybrid-android.sh devices
 ```
 
-The wrapper calls the existing `build-run-ggmlhexagon-android.sh` for NDK/Hexagon setup, FastRPC skel generation and synchronized AP deployment; it downloads the same LunarG SDK as the Vulkan-only script and adds `-DGGML_VULKAN=ON`. It does not overwrite the known-good `out/ggmlhexagon-android`, `out/ab-test`, or `/data/local/tmp` files. Hybrid artifacts use `out/ggmlhybrid-android` and `/data/local/tmp/ggml-hybrid`.
+The wrapper calls the existing `build-run-ggmlhexagon-android.sh` for NDK/Hexagon setup, FastRPC skel generation and synchronized AP deployment; it downloads the same LunarG SDK as the Vulkan-only script and adds `-DGGML_VULKAN=ON`. The `update_fastrpc_libs` alias uploads matched AP libraries, Vulkan backend, DSP skeletons and executables from the hybrid `bin/` without recompiling or using the old `out/ab-test` snapshots. It does not overwrite the known-good `out/ggmlhexagon-android`, `out/ab-test`, or `/data/local/tmp` files unless `GGML_REMOTE_PATH` is explicitly overridden. Hybrid artifacts use `out/ggmlhybrid-android` and `/data/local/tmp/ggml-hybrid`.
 
 Verify both devices before loading a model:
 

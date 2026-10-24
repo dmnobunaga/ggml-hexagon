@@ -11,12 +11,10 @@ export GGML_REMOTE_PATH="${GGML_REMOTE_PATH:-/data/local/tmp/ggml-hybrid}"
 case "${1:-build}" in
     build)
         "$ROOT/scripts/build-run-ggmlhexagon-android.sh" build
-        for binary in llama-bench llama-completion llama-cli; do
-            if [ -f "${GGML_LOCAL_BUILD_DIR}/bin/${binary}" ]; then
-                adb push "${GGML_LOCAL_BUILD_DIR}/bin/${binary}" "${GGML_REMOTE_PATH}/"
-                adb shell "chmod 755 '${GGML_REMOTE_PATH}/${binary}'"
-            fi
-        done
+        "$ROOT/scripts/build-run-ggmlhexagon-android.sh" update_hybrid_libs
+        ;;
+    update_fastrpc_libs|update_hybrid_libs|update)
+        "$ROOT/scripts/build-run-ggmlhexagon-android.sh" update_hybrid_libs
         ;;
     clean)
         "$ROOT/scripts/build-run-ggmlhexagon-android.sh" clean
@@ -25,7 +23,7 @@ case "${1:-build}" in
         adb shell "cd '${GGML_REMOTE_PATH}' && export LD_LIBRARY_PATH='${GGML_REMOTE_PATH}' && export ADSP_LIBRARY_PATH='${GGML_REMOTE_PATH}' && ./llama-bench --list-devices"
         ;;
     *)
-        echo "Usage: $0 {build|clean|devices}" >&2
+        echo "Usage: $0 {build|update_fastrpc_libs|devices|clean}" >&2
         exit 2
         ;;
 esac

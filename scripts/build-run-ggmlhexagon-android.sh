@@ -843,6 +843,57 @@ function update_ggml_libs()
 }
 
 
+# Push a coherent HTP + Vulkan runtime from the current build directory,
+# using the same helpers as the FastRPC pipeline without touching out/ab-test.
+function update_hybrid_libs()
+{
+    if [ "${GGML_HYBRID_VULKAN:-0}" != "1" ]; then
+        echo "ERROR: update_hybrid_libs requires GGML_HYBRID_VULKAN=1" >&2
+        return 1
+    fi
+
+    local bin="${LOCAL_BUILD_DIR}/bin"
+    local required
+    for required in libggml-base.so libggml-cpu.so libggml-hexagon.so libggml-vulkan.so \
+                    libggml.so libllama.so libllama-common.so \
+                    libllama-bench-impl.so libllama-completion-impl.so \
+                    libllama-server-impl.so libmtmd.so; do
+        if [ ! -f "${bin}/${required}" ]; then
+            echo "ERROR: missing hybrid runtime: ${bin}/${required}" >&2
+            return 1
+        fi
+    done
+
+    local found_skel=0
+    local ver
+    for ver in ${HTP_ARCH_VERSIONS}; do
+        if [ -f "${bin}/libggml-htp-${ver}.so" ]; then
+            found_skel=1
+        fi
+    done
+    if [ "$found_skel" -ne 1 ]; then
+        echo "ERROR: missing FastRPC DSP skeletons in ${bin}" >&2
+        return 1
+    fi
+
+    adb shell "mkdir -p '${REMOTE_PATH}'"
+    prepare_fastrpc_skels
+    update_ggml_libs
+
+    local executable
+    for executable in llama-bench llama-completion llama-cli llama-server; do
+        if [ -f "${bin}/${executable}" ]; then
+            adb push "${bin}/${executable}" "${REMOTE_PATH}/${executable}"
+            adb shell "chmod 755 '${REMOTE_PATH}/${executable}'"
+        fi
+    done
+
+    echo "hybrid" > "${LOCAL_BUILD_DIR}/.ab_test_runtime"
+    echo "hybrid" > "${LOCAL_BUILD_DIR}/.last_deployed_build_type"
+    echo "Hybrid FastRPC + Vulkan runtime updated in ${REMOTE_PATH}"
+}
+
+
 #push mempool/FastRPC runtime .so from out/ab-test/ to device, renaming *-fastrpc.so to canonical names
 function update_fastrpc_libs()
 {
@@ -1728,6 +1779,7 @@ function show_usage()
     echo "  $0 clean"
 
     echo "  $0 update_fastrpc_libs      (push mempool/FastRPC runtime .so from out/ab-test/ to device, for build)"
+    echo "  $0 update_hybrid_libs       (push combined HTP + Vulkan build artifacts from current bin/, no rebuild)"
     echo "  $0 update_dspqueue_libs     (push dspqueue runtime .so from out/ab-test/ to device, for build_dspqueue)"
     echo "  $0 update_cpu_libs          (push CPU-only runtime .so from out/ab-test/ to device, for build_armcpu)"
     echo "  $0 update_ggml_libs         (incremental: push AP-side libs from bin/ to device only; keep DSP skels as-is)"
@@ -1834,7 +1886,9 @@ check_android_phone
 check_and_download_ndk
 check_and_download_opencl_sdk
 check_and_download_hexagon_sdk
-check_prebuilt_models
+if [ "${1:-}" != "update_hybrid_libs" ]; then
+    check_prebuilt_models
+fi
 
 if [ $# == 0 ]; then
     show_usage
@@ -1855,6 +1909,9 @@ elif [ $# == 1 ]; then
     elif [ "$1" == "update_fastrpc_libs" ]; then
         update_fastrpc_libs
         exit 0
+    elif [ "$1" == "update_hybrid_libs" ]; then
+        update_hybrid_libs
+        exit $?
     elif [ "$1" == "update_dspqueue_libs" ]; then
         update_dspqueue_libs
         exit 0
