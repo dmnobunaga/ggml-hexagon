@@ -501,3 +501,55 @@ start live `adb logcat -b all -v time -s adsprpc:V ggml-hexagon:V`
 capture **before** a controlled run; later dump-only collection can
 miss transient/rotated messages. Consider read-only map/evict/sync
 timing counters if further optimization is required.
+
+#### Sustained PP128/TG64 VA churn from same-session logs (2026-10-24)
+
+The operator provided DSP logcat for PID `30759` spanning
+`14:43:29`–`14:44:14`, overlapping the longer benchmark whose
+end timestamp was `14:44:40`. Per-context counters emitted by
+`ggml/src/ggml-hexagon/htp/entry.c` show:
+
+| Time | Cumulative maps | Cumulative evictions | Active DSP VA |
+| --- | ---: | ---: | ---: |
+| 14:43:56.282 | 128 | 122 | 2557 MiB |
+| 14:43:59.055 | 256 | 250 | 2296 MiB |
+| 14:44:01.741 | 384 | 378 | 2557 MiB |
+| 14:44:04.546 | 512 | 506 | 2557 MiB |
+| 14:44:07.336 | 640 | 634 | 2296 MiB |
+| 14:44:10.019 | 768 | 762 | 2557 MiB |
+| 14:44:12.940 | 896 | 891 | 2056 MiB |
+
+Between map counts 128 and 896 (16.658 s), the **rate of successful
+weight map operations was ~46.1/s**, while eviction counts climbed
+almost one-for-one. `891/896 = 99.4%` compares cumulative counts,
+not independent probabilities or all model compute time. The active
+DSP VA shown remains under the configured 2560-MiB window, including
+pinned runtime mappings.
+
+At `14:44:14.017` another
+`[DSP-VA] weight mapping window=2560 MiB` initialization and
+`lazy-weight slot=1` appears under the **same PID**. Treat counters
+as scoped to a DSP context/session; the 896 observation is not a
+whole-process/whole-benchmark final counter.
+
+**Source inspection:** In `htp/entry.c`, each per-op mapping miss
+invokes `dsp_queues_suspend()` (which suspends HMX, flushes HMX
+and suspends the work queue); `dsp_va_prepare_op()` runs
+`HAP_munmap2` for eviction and `HAP_mmap2` for new mappings;
+`weight_inval_reset_all()` runs on map and unmap; the execution path
+then marks segment tensors as needing invalidation and wakes queues.
+Thus the possible performance cost is not just `HAP_mmap2`, but
+the full queue synchronization / eviction / mapping / invalidation
+sequence. The ~20–25 ms intervals between logging checkpoints
+are not pure mmap timings.
+
+**Next instrumentation:** DSP-side per-batch and accumulated counters
+for mapping misses, `HAP_mmap2` elapsed us, `HAP_munmap2`
+elapsed us, `dsp_queues_suspend` and queue wakeup elapsed us,
+and invalidation reset elapsed us; include counts, cache-hit rate,
+and max active VA. Produce one aggregate summary per model/context
+before teardown or report through RPC so multiple llama-bench test
+contexts do not silently reset diagnostics. Preserve existing queue
+safety and all memory guard behavior. A window-size A/B may be
+considered afterward (current AP validation allows only 512..3072
+MiB, in multiples of 64).
