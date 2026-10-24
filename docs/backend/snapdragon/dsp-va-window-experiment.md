@@ -324,3 +324,41 @@ PP128/TG32 runs.
 using short PP16/TG4 and sufficient initial MemAvailable; inspect
 DSP-VA map/evict diagnostics and ensure PP/TG complete before
 considering `-ngl 24` on the same VA configuration.
+
+#### Spark-X2.5-4B BF16 — matched 15 layers, VA ON 2560 MiB (2026-10-24)
+
+**PASS (short inference with experimental VA window)**. Snapdragon 8 Elite
+Gen 5, HTP v81, build `d97c0ba1b` (12492). Same `-ngl 15 -lm mmap`,
+`-t 6 --poll 1000 -fa 1 --ubatch-size 128 -p 16 -n 4 -r 1`
+as the preceding VA OFF baseline, in a fresh process. Set
+`GGML_HEXAGON_DSP_VA_WINDOW_MB=2560`; test-only forced descending unset;
+memory guard enabled.
+
+- `strategy=exact-full selected_ngl=15 mapped=8/8`;
+  `dsp_weight_mapped=3441.41 MiB`; workspace `256.00 MiB`.
+  These mapped/registered weight **totals** do not establish simultaneous
+  DSP VA residency, which is limited by the window.
+- `cpu_weight_mmap=5042.15 MiB`, `cpu_weight_anon=0.00 MiB`.
+- `pp16=5.50 t/s`, `tg4=3.71 t/s` (single repeat).
+  The previous VA OFF single-repeat run gave `pp16=6.03 t/s`,
+  `tg4=3.99 t/s` (observed differences -8.8%, -7.0%).
+- `avg_graph=101.896 ms`, `avg_p9=101.491 ms`,
+  avg AP overhead `0.405 ms`, 496 DSP graph nodes, over 7 calls.
+  For VA OFF: graph `76.879 ms`, P9 `76.432 ms`,
+  AP overhead `0.447 ms`. The largest timing increase is accounted
+  within P9, not measured AP-side graph overhead; attribution to VA
+  map/eviction requires mapping event counters/logs.
+- `MemAvailable_start=8363.23 MiB`,
+  `MemAvailable_loaded=5345.07 MiB`;
+  `SwapFree_start=7575.52 MiB`,
+  `SwapFree_loaded=7150.99 MiB`;
+  `VmSwap_loaded=0`, `VmRSS_loaded=343.80 MiB`.
+  Initial system memory conditions differed from the VA OFF run.
+
+The device operator captured
+`spark-bf16-15-va-mapping.log` from logcat, but its *contents were
+not supplied* for review. This run confirms the feature permits
+15-layer inference with a 2560 MiB window, but not exact mapping/
+eviction counts or their timing contribution. Collect mapping log
+contents and preferably repeat both modes under comparable conditions
+before drawing a performance conclusion or raising ngl to 24.
