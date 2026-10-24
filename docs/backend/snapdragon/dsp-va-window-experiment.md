@@ -259,3 +259,30 @@ higher ngl values or the optional 2560-MiB VA window. Leave memory guard
 enabled, never force `GGML_MEM_GUARD_WARN_ONLY=1`; the guard checks
 preflight accounting but does not guarantee protection against all
 system-wide memory pressure and Android OOM.
+
+#### On-device result — 2026-10-24
+
+**PASS (synthetic healthy full-plan rollback)** on Snapdragon 8 Elite Gen 5,
+HTP v81, build `d97c0ba1b` (12492). Command used the smoke-test
+configuration above with `GGML_HEXAGON_TEST_FORCE_DESCENDING=1`,
+DSP VA window OFF and memory guard enabled.
+
+Observed:
+- `TEST ONLY: forcing exact-descending after healthy full-plan reservation`
+- `strategy=exact-descending (transactional per-ngl DSP mappings)`
+- `trial_ngl=35 mapped=4/4 result=FIT`
+- `exact-descending selected_ngl=35 mapped=4/4`
+- 4 DSP weight segments; `dsp_weight_mapped=1296.59 MiB`,
+  workspace `256.00 MiB`; CPU anonymous weights `1804.83 MiB`,
+  CPU file-backed weights `0.00 MiB`.
+- `pp16=237.02 t/s`, `tg4=35.08 t/s` (one repeat each);
+  1435 DSP graph nodes; no error shown in the captured benchmark output.
+- `MemAvailable_loaded=3501.31 MiB`, `VmSwap_loaded=0`.
+
+The successful transition from a 36-layer full reservation to a
+35-layer independently packed reservation confirms the healthy rollback,
+re-probe, exact-fit acceptance and subsequent inference in this synthetic
+case. It **does not** verify real partial mapping failures, repeated
+candidate rejections, unhealthy rollback recovery, process teardown,
+or token-for-token output correctness. Single-repeat PP/TG values should
+not be used as performance-regression evidence across different `ngl`.
