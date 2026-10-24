@@ -790,3 +790,37 @@ capture a final in-context profiler pair and throughput from a
 setting at both window sizes, tracking temperature, clocks, and
 memory state if the unexpected TG variability persists. Keep
 memory guard active.
+
+### Preliminary 1024-MiB segmentation test at 3072-MiB VA window
+
+Operator single-repeat Spark-X2.5-4B BF16 smoke measurement, requested
+`-ngl 22`, `-p 16 -n 16 -r 1`, `-lm mmap`,
+`--ubatch-size 128`, `-t 6`, with
+`GGML_HEXAGON_SEGMENT_MB=1024`,
+`GGML_HEXAGON_MEMORY_RESERVE_MB=2536`,
+`GGML_HEXAGON_DSP_VA_WINDOW_MB=3072` and
+`GGML_HEXAGON_DSP_VA_PROFILE=1`:
+**PP16 9.66 t/s, TG16 4.30 t/s**. Effective offload,
+segment size layout, DSP VA counters and memory snapshots from this
+run have not yet been provided.
+
+For context, an earlier *single-repeat* 3072-MiB test with
+`SEGMENT_MB=512`, `MEMORY_RESERVE_MB=1536` reported
+PP16 5.44 t/s, TG16 4.57 t/s. The observed PP16 difference is
++77.6% and TG16 -5.9%, but **two variables changed** and samples
+were obtained under different runtime conditions. The earlier
+512-MiB run itself varied (PP16 3.86 to 5.44 t/s on repeats),
+so this does not yet demonstrate a causal segmentation speedup.
+
+Source inspection: `GGML_HEXAGON_SEGMENT_MB` affects greedy
+weight-tensor chunk grouping (default 1024 MiB, 1024-MiB hard cap);
+`GGML_HEXAGON_MEMORY_RESERVE_MB` is a memory-guard/headroom
+threshold, not a reserved physical allocation. Larger segments
+can reduce segment count but may change VA churn and packing.
+
+**Isolation:** compare `SEGMENT_MB=1024`,
+`MEMORY_RESERVE_MB=1536` with this run at otherwise identical
+flags and enough available memory. Report `effective_ngl`,
+`dsp_weight_segments`, `dsp_segment_slot_*`, performance and
+last same-context `[DSP-VA-PROF]` pair. No allocator or LRU code
+changes yet; profiler/debug data are needed to establish mechanism.
