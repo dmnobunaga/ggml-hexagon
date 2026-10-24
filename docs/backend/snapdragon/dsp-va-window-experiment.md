@@ -670,3 +670,35 @@ short `-p 16 -n 16 -r 1`, safe memory headroom, and verified
 `effective_ngl`. Do not infer that profiled HAP operations,
 HMX suspend, cache tracking or LRU caused the regression until
 the new A/B isolates the effect. Keep the memory guard enabled.
+
+### Matched effective-ngl 22 smoke A/B — profiling OFF vs ON
+
+Same build `1592c59d9` (12505), explicit requested
+`-ngl 22`, effective `ngl=22`, full-plan 11/11
+segments in **both** runs, `-lm mmap`, VA window 2560 MiB,
+`-p 16 -n 16 -r 1`. The operator's loop ran
+`GGML_HEXAGON_DSP_VA_PROFILE=0` first, then `=1`.
+
+| Short single-repeat measurement | Profile OFF | Profile ON |
+| --- | ---: | ---: |
+| PP16 (t/s) | 6.51 | 5.45 |
+| TG16 (t/s) | 3.21 | 3.76 |
+| MemAvailable_loaded (MiB) | 3084.66 | 2989.52 |
+| VmSwap_loaded (MiB) | 28.96 | 29.22 |
+
+The ON/OFF performance changes are opposite in sign: -16.3%
+PP, +17.1% TG. Neither regime reproduced the earlier
+`tg64=0.48 t/s` result in this shorter workload; single-run
+variability precludes profiler-overhead attribution.
+
+These exact-full `-ngl 22` tests do **not** resolve why a previous
+run with requested `-ngl 24` resulted in effective 22; retain
+the earlier planner question separately.
+
+**Next isolating test:** hold effective NGL=22, VA window=2560,
+mmap and memory guard fixed, run the same longer
+`-p 128 -n 64 -r 1` for profile OFF and ON, first checking
+`effective_ngl`. Only then decide whether the earlier sharp
+TG slowdown depends on decode length, prompt length, model state,
+profiling, or other run conditions. Continue collecting filtered
+`[DSP-VA-PROF]` data rather than full logcat.
