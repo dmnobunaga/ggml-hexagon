@@ -286,3 +286,41 @@ case. It **does not** verify real partial mapping failures, repeated
 candidate rejections, unhealthy rollback recovery, process teardown,
 or token-for-token output correctness. Single-repeat PP/TG values should
 not be used as performance-regression evidence across different `ngl`.
+
+#### Spark-X2.5-4B BF16 — explicit mmap, VA OFF (2026-10-24)
+
+**PASS (large-model mmap path)** on Snapdragon 8 Elite Gen 5 HTP v81,
+build `d97c0ba1b` (12492), with `GGML_HEXAGON_TEST_FORCE_DESCENDING`
+unset. Settings: `-ngl 15 -lm mmap -t 6 --poll 1000 -fa 1
+--ubatch-size 128 -p 16 -n 4 -r 1`,
+`GGML_HEXAGON_SEGMENTED_RPCMEM=1`,
+`GGML_HEXAGON_ADAPTIVE_OFFLOAD=1`,
+`GGML_HEXAGON_SEGMENT_MB=512`,
+`GGML_HEXAGON_MEMORY_RESERVE_MB=1536`, VA window unset,
+memory guard enabled.
+
+- `strategy=exact-full selected_ngl=15 mapped=8/8`;
+  `dsp_weight_mapped=3441.41 MiB`; workspace `256.00 MiB`.
+- `cpu_weight_mmap=5042.15 MiB`, `cpu_weight_anon=0.00 MiB`:
+  these are weight-buffer accounting figures, **not** resident set size.
+- `pp16=6.03 t/s`, `tg4=3.99 t/s` (one repeat each).
+  `avg_graph=76.879 ms`, `avg_p9=76.432 ms`,
+  AP overhead `0.447 ms`, 496 DSP graph nodes.
+- `MemAvailable_start=6867.74 MiB`,
+  `MemAvailable_loaded=4561.13 MiB`;
+  `SwapFree_start=9049.29 MiB`,
+  `SwapFree_loaded=8060.34 MiB`;
+  `VmSwap_loaded=0`, `VmRSS_loaded=257.91 MiB`.
+  Decline in system-wide SwapFree does not establish process swapping.
+
+This run confirms a successful inference with explicit mmap on the
+current branch and 3.44 GiB mapped DSP weights without a VA window.
+It does **not** validate the VA-window path or larger HTP placements.
+PP16/TG4 single-repeat figures are not directly comparable with earlier
+PP128/TG32 runs.
+
+**Next controlled gate:** repeat fixed `-ngl 15 -lm mmap` with
+`GGML_HEXAGON_DSP_VA_WINDOW_MB=2560` in a fresh process,
+using short PP16/TG4 and sufficient initial MemAvailable; inspect
+DSP-VA map/evict diagnostics and ensure PP/TG complete before
+considering `-ngl 24` on the same VA configuration.
