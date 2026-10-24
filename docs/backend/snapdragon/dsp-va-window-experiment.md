@@ -454,3 +454,50 @@ before attributing the P9 latency increase to VA eviction. For further
 24-layer runs, inspect process-level swapping and compare matched
 `-p 128 -n 64 -r 3` workloads in new processes only when sufficient
 system memory headroom is available. Do not bypass the memory guard.
+
+#### Spark-X2.5-4B BF16 — sustained 24-layer PP128/TG64 (2026-10-24)
+
+**PASS (three-repeat longer benchmark)**. Snapdragon 8 Elite Gen 5,
+HTP v81, host benchmark build `e0b1c238f` (12495); explicit
+`-lm mmap`, `-ngl 24`, `-t 6 --poll 1000 -fa 1 --ubatch-size 128`,
+`-p 128 -n 64 -r 3`; segmented RPCMEM, adaptive planner ON,
+`GGML_HEXAGON_DSP_VA_WINDOW_MB=2560`, `GGML_HEXAGON_SEGMENT_MB=512`,
+`GGML_HEXAGON_MEMORY_RESERVE_MB=1536`, forced-descending OFF and
+memory guard enabled.
+
+- `strategy=exact-full selected_ngl=24 mapped=12/12`;
+  `dsp_weight_mapped=5242.30 MiB`; workspace `256.00 MiB`;
+  CPU file-backed buffer accounting `3241.27 MiB`,
+  CPU anonymous weight accounting `0 MiB`.
+- **PP128 `10.26 ± 0.70 t/s`; TG64 `4.20 ± 0.04 t/s`.**
+  Earlier 24-layer VA ON experimental build `f308c7499` reported
+  PP128 `6.83 ± 0.27 t/s` and TG64 `4.48 ± 0.20 t/s`
+  under other conditions. Numerically that is +50.2% PP and -6.3%
+  TG vs the historical results, **not** a controlled code-version
+  comparison; do not attribute the difference to any single change.
+- `batch_calls=197`, `cgraph cache hits=195 misses=2`
+  (99.0% hit rate), 811 graph nodes;
+  `avg_p9=141.325 ms`, `avg_graph=141.756 ms`,
+  `avg AP overhead=0.431 ms`.
+- `MemAvailable_start=8329.57 MiB`,
+  `MemAvailable_loaded=2919.24 MiB`;
+  `SwapFree_start=6784.69 MiB`,
+  `SwapFree_loaded=6434.03 MiB`;
+  process `VmSwap_loaded=28.83 MiB`,
+  `VmRSS_loaded=15.91 MiB`, `VmHWM_loaded=2696.16 MiB`.
+  Model mmap accounting is not process RSS. A small final RSS and
+  nonzero swap deserve investigation; neither alone establishes an OOM.
+- The operator reported no console output after piping
+  `adb logcat -d -v time` through `Select-String` to `Out-File`.
+  `Out-File` normally suppresses console output; the size and contents
+  of the written file have not been inspected. DSP-VA per-graph
+  counters and precise mapping latency remain unavailable.
+
+This validates completion of a longer multi-repeat inference workload
+with 5.24 GiB registered weights and a 2.5 GiB DSP VA window. It is
+not a stress test of repeated model construction/teardown, long-context
+correctness, or stability under low RAM. For targeted mapping timings,
+start live `adb logcat -b all -v time -s adsprpc:V ggml-hexagon:V`
+capture **before** a controlled run; later dump-only collection can
+miss transient/rotated messages. Consider read-only map/evict/sync
+timing counters if further optimization is required.
