@@ -1599,6 +1599,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const char * segmented_env = std::getenv("GGML_HEXAGON_SEGMENTED_RPCMEM");
     const bool adaptive_htp = adaptive_env && std::strcmp(adaptive_env, "1") == 0 &&
                               segmented_env && std::strcmp(segmented_env, "1") == 0;
+    const char * hybrid_env = std::getenv("GGML_HEXAGON_HYBRID_VULKAN");
+    const bool hybrid_htp = adaptive_htp && hybrid_env && std::strcmp(hybrid_env, "1") == 0;
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
@@ -1650,6 +1652,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
     }
 
+    ggml_backend_dev_t hybrid_htp_dev = nullptr;
+    ggml_backend_dev_t hybrid_vk_dev = nullptr;
+    if (hybrid_htp) {
+        if (devices.size() != 2) {
+            throw std::runtime_error("[HTP-HYBRID] expected exactly HTP and Vulkan devices");
+        }
+        for (const auto & entry : devices) {
+            const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(entry.dev));
+            if (std::strcmp(name, "HTP") == 0) hybrid_htp_dev = entry.dev;
+            if (std::strcmp(name, "Vulkan") == 0) hybrid_vk_dev = entry.dev;
+        }
+        if (!hybrid_htp_dev || !hybrid_vk_dev || devices[0].dev != hybrid_htp_dev) {
+            throw std::runtime_error("[HTP-HYBRID] device order must be HTP,Vulkan");
+        }
+    }
+
     // calculate the split points
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
     std::vector<float> splits(n_devices());
@@ -1687,6 +1705,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+        if (hybrid_htp) {
+            // Preserve descending HTP layers/output; route only the CPU
+            // overflow blocks to Vulkan, keeping the HTP weight plan intact.
+            const bool on_htp = il >= i_gpu_start && (il - i_gpu_start) < act_gpu_layers;
+            ggml_backend_dev_t dev = on_htp ? hybrid_htp_dev : hybrid_vk_dev;
+            if (!ml.no_alloc) {
+                LLAMA_LOG_INFO("[HTP-HYBRID] planned layer[%d] -> %s\n", il, ggml_backend_dev_name(dev));
+            }
+            return {dev, &pimpl->gpu_buft_list.at(dev)};
+        }
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
@@ -1926,6 +1954,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         size_t planned_cpu = 0;
         size_t planned_cpu_mmap = 0;
         size_t planned_htp_bytes = 0;
+        size_t planned_other_bytes = 0;
         const char * segmented_env = std::getenv("GGML_HEXAGON_SEGMENTED_RPCMEM");
         const bool segmented_rpcmem = segmented_env && std::strcmp(segmented_env, "1") == 0;
         const char * warn_only_env = std::getenv("GGML_MEM_GUARD_WARN_ONLY");
@@ -1993,6 +2022,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         planned_cpu_mmap += bytes;
                     }
                 }
+            } else {
+                // Vulkan's Android allocations draw from the same physical RAM.
+                if (bytes > SIZE_MAX - planned_other_bytes) {
+                    throw std::runtime_error("[MEM-GUARD] GPU/other size overflow");
+                }
+                planned_other_bytes += bytes;
             }
         }
 
@@ -2044,6 +2079,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             const size_t available_mb = (size_t) available_kib / 1024;
             const size_t planned_cpu_anon = planned_cpu - planned_cpu_mmap;
             const size_t planned_cpu_mb = planned_cpu_anon / MiB + (planned_cpu_anon % MiB != 0);
+            const size_t planned_other_mb = planned_other_bytes / MiB + (planned_other_bytes % MiB != 0);
             if (adaptive_htp) {
                 LLAMA_LOG_INFO("[MEM-GUARD] CPU file-backed mmap=%.2f MiB anonymous=%.2f MiB\n",
                                (double) planned_cpu_mmap / MiB, (double) planned_cpu_anon / MiB);
@@ -2075,9 +2111,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 LLAMA_LOG_INFO("[HTP-OFFLOAD] already reserved=%.2f MiB; HTP bytes not double-counted in RAM guard\n",
                                (double) already_reserved_htp / MiB);
             }
-            const size_t required_mb = planned_cpu_mb + planned_htp_mb + reserve_mb;
-            LLAMA_LOG_INFO("[MEM-GUARD] MemAvailable=%zu MiB planned_cpu=%zu MiB planned_htp=%zu MiB reserve=%zu MiB required=%zu MiB segmented=%d\n",
-                available_mb, planned_cpu_mb, planned_htp_mb, reserve_mb, required_mb, (int)segmented_rpcmem);
+            const size_t required_mb = planned_cpu_mb + planned_other_mb + planned_htp_mb + reserve_mb;
+            LLAMA_LOG_INFO("[MEM-GUARD] MemAvailable=%zu MiB planned_cpu=%zu MiB planned_gpu_other=%zu MiB planned_htp=%zu MiB reserve=%zu MiB required=%zu MiB segmented=%d\n",
+                available_mb, planned_cpu_mb, planned_other_mb, planned_htp_mb, reserve_mb, required_mb, (int)segmented_rpcmem);
             if (required_mb > available_mb) {
                 if (guard_warn_only) {
                     LLAMA_LOG_WARN("[MEM-GUARD] WARN-ONLY: required=%zu MiB available=%zu MiB deficit=%zu MiB; continuing into allocations\n",
