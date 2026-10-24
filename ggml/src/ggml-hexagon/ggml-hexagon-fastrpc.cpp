@@ -1890,9 +1890,16 @@ static int ggmlhexagon_probe_dspinfo(ggml_backend_hexagon_context * ctx) {
         return 0;
     }
 
+    // DSPRPC_GET_DSP_INFO expects the physical domain (e.g. CDSP0=3),
+    // not the effective FastRPC session/domain ID (e.g. 100000).
+    const int capability_domain = opt_device_configs[ctx->device].domain_id;
     int htp_arch         = 0;
     uint32_t dsp_version = 0;
-    ggmlhexagon_get_htp_arch_ver(ctx->domain_id, &dsp_version);
+    const int arch_err = ggmlhexagon_get_htp_arch_ver(capability_domain, &dsp_version);
+    if (arch_err != AEE_SUCCESS) {
+        GGMLHEXAGON_LOG_ERROR("HTP architecture probe failed: capability_domain=%d effective_domain=%d err=0x%x",
+                              capability_domain, ctx->domain_id, arch_err);
+    }
     if (dsp_version == 0x68 || dsp_version == 0x69 || dsp_version == 0x73
         || dsp_version == 0x75 || dsp_version == 0x79 || dsp_version == 0x81) {
         //0x68 -> 68, 0x69 -> 69, 0x73 -> 73, 0x75 -> 75, 0x79 -> 79, 0x81 -> 81
@@ -1910,18 +1917,18 @@ static int ggmlhexagon_probe_dspinfo(ggml_backend_hexagon_context * ctx) {
 
     uint32_t vtcm_count = 0;
     uint32_t vtcm_page  = 0;
-    ggmlhexagon_get_vtcm_info(ctx->domain_id, VTCM_COUNT, &vtcm_count);
-    ggmlhexagon_get_vtcm_info(ctx->domain_id, VTCM_PAGE, &vtcm_page);
+    ggmlhexagon_get_vtcm_info(capability_domain, VTCM_COUNT, &vtcm_count);
+    ggmlhexagon_get_vtcm_info(capability_domain, VTCM_PAGE, &vtcm_page);
     ctx->has_vtcm = (vtcm_count > 0 && vtcm_page > 0);
 
     uint32_t hmx_depth   = 0;
     uint32_t hmx_spatial = 0;
     //FIXME: better approach to get correct/accurate info
-    ggmlhexagon_get_hmx_support_info(ctx->domain_id, HMX_SUPPORT_DEPTH, &hmx_depth);
-    ggmlhexagon_get_hmx_support_info(ctx->domain_id, HMX_SUPPORT_SPATIAL, &hmx_spatial);
+    ggmlhexagon_get_hmx_support_info(capability_domain, HMX_SUPPORT_DEPTH, &hmx_depth);
+    ggmlhexagon_get_hmx_support_info(capability_domain, HMX_SUPPORT_SPATIAL, &hmx_spatial);
 
     uint32_t hvx_support_128b = 0;
-    ggmlhexagon_get_hvx_support_info(ctx->domain_id, HVX_SUPPORT_128B, &hvx_support_128b);
+    ggmlhexagon_get_hvx_support_info(capability_domain, HVX_SUPPORT_128B, &hvx_support_128b);
     ctx->has_hvx = (hvx_support_128b > 0);
     ctx->has_hmx = (hmx_depth > 0 || hmx_spatial > 0);
     // Fallback: DSPRPC_GET_DSP_INFO may not report HMX on some devices
@@ -1931,12 +1938,12 @@ static int ggmlhexagon_probe_dspinfo(ggml_backend_hexagon_context * ctx) {
     }
     GGMLHEXAGON_LOG_DEBUG("dsp arch version %d, vtcm_count %d, vtcm_page %d", htp_arch, vtcm_count, vtcm_page);
     //FIXME: hmx_depth/hmx_spatial report 0 via DSPRPC_GET_DSP_INFO on some devices
-    ctx->has_async_fastrpc  = ggmlhexagon_is_async_fastrpc_supported(ctx->domain_id);
-    ctx->has_extended_map   = ggmlhexagon_is_extended_map_supported(ctx->domain_id);
+    ctx->has_async_fastrpc  = ggmlhexagon_is_async_fastrpc_supported(capability_domain);
+    ctx->has_extended_map   = ggmlhexagon_is_extended_map_supported(capability_domain);
     GGMLHEXAGON_LOG_ALWAYS("device %d caps: has_vtcm=%d,has_hvx=%d,has_hmx=%d,hvx_support_128b %d,"
                             "unsigned pd supported %d, async fastrpc supported %d, extended va map supported %d",
                                 ctx->device, (int)ctx->has_vtcm, (int)ctx->has_hvx, (int)ctx->has_hmx, hvx_support_128b,
-                                ggmlhexagon_is_unsignedpd_supported(ctx->domain_id),
+                                ggmlhexagon_is_unsignedpd_supported(capability_domain),
                                 (int)ctx->has_async_fastrpc,
                                 (int)ctx->has_extended_map);
     return htp_arch;
@@ -2301,8 +2308,9 @@ static void ggmlhexagon_deinit_cdsp(ggml_backend_hexagon_context * ctx) {
         GGMLHEXAGON_LOG_ERROR("[RPC-SEG] DSP close failed; retained_segments=%zu workspace=%zu MiB (cleanup deferred to process exit)",
                               ctx->rpc_segments.size(), ctx->rpc_mempool_len / SIZE_IN_MB);
     }
-    //Probe before domain_id is invalidated so AP-side domain queries still work
-    if (ctx->domain_id >= 0) {
+    // Do not re-probe capabilities after a failed DSP initialization.
+    // On init failure, FastRPC's effective session domain may be invalid.
+    if (ctx->domain_id >= 0 && ctx->socinfo.soc_desc != nullptr) {
         ggmlhexagon_probe_dspinfo(ctx);
     }
     ggmlhexagon_dump_perf_stats(ctx);
@@ -2315,6 +2323,7 @@ static int ggmlhexagon_init_dsp(ggml_backend_hexagon_context * ctx) {
     int htp_arch                = 0;
     int hexagon_error           = AEE_SUCCESS;
     int domain_id               = CDSP_DOMAIN_ID;
+    int capability_domain       = CDSP_DOMAIN_ID;
     bool got_uri                = false;
     bool is_unsignedpd_enabled  = false;
     char final_uri[512];
@@ -2338,6 +2347,7 @@ static int ggmlhexagon_init_dsp(ggml_backend_hexagon_context * ctx) {
         ctx->physical_idx = cfg.physical_idx;
         ctx->virtual_idx  = cfg.virtual_idx;
         domain_id         = cfg.domain_id;
+        capability_domain = cfg.domain_id;
     }
 
     if (domain_id < 0) {
@@ -2405,12 +2415,17 @@ static int ggmlhexagon_init_dsp(ggml_backend_hexagon_context * ctx) {
     }
 
     ctx->domain_id = domain_id;
-    GGMLHEXAGON_LOG_ALWAYS("using Hexagon domain %d(%s)", domain_id, ggmlhexagon_get_dsp_name(domain_id));
+    GGMLHEXAGON_LOG_ALWAYS("using Hexagon domain %d(%s), capability_domain %d",
+                           domain_id, ggmlhexagon_get_dsp_name(capability_domain), capability_domain);
 
-    is_unsignedpd_enabled = ggmlhexagon_is_unsignedpd_supported(domain_id);
-    GGMLHEXAGON_LOG_ALWAYS("unsignedpd_enabled %d", is_unsignedpd_enabled);
+    // Capability queries use the physical domain; effective_domain_id is
+    // reserved for FastRPC mappings, session URIs and runtime operations.
+    is_unsignedpd_enabled = ggmlhexagon_is_unsignedpd_supported(capability_domain);
+    GGMLHEXAGON_LOG_ALWAYS("unsignedpd_enabled %d (capability_domain=%d effective_domain=%d)",
+                           is_unsignedpd_enabled, capability_domain, domain_id);
     if (!is_unsignedpd_enabled) {
-        GGMLHEXAGON_LOG_ERROR("unsigned PD not allowed on domain %d, using signed offload", domain_id);
+        GGMLHEXAGON_LOG_ERROR("unsigned PD not allowed: capability_domain=%d effective_domain=%d",
+                              capability_domain, domain_id);
         goto bail;
     }
 
