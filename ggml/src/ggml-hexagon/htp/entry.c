@@ -2454,20 +2454,40 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
                 if (!g_dsp_ctx->rpc_segments[slot].base) need_map = true;
             }
             if (need_map) {
+                const bool profile_va = g_dsp_ctx->dsp_va_profile_enabled != 0;
+                const int64_t transition_t0 = profile_va ? ggml_time_us() : 0;
+                if (profile_va) g_dsp_ctx->dsp_va_profile_misses++;
+                const int64_t suspend_t0 = profile_va ? ggml_time_us() : 0;
                 dsp_queues_suspend();
+                if (profile_va) {
+                    g_dsp_ctx->dsp_va_profile_suspend_us += (uint64_t)(ggml_time_us() - suspend_t0);
+                }
                 if (!dsp_va_prepare_op(needed)) {
+                    if (profile_va) {
+                        g_dsp_ctx->dsp_va_profile_transition_us += (uint64_t)(ggml_time_us() - transition_t0);
+                        dsp_va_profile_dump(g_dsp_ctx, "mapping-failure");
+                    }
                     return AEE_EFAILED;
                 }
                 // Weight VA may be reused for a different physical segment.
                 // Per-batch tensor invalidation must not preserve old addresses.
                 // Do not reset activation flags: DSP-written intermediates may
                 // still reside only in L2 and must not be invalidated again.
+                const int64_t mark_t0 = profile_va ? ggml_time_us() : 0;
                 for (uint32_t ti = 0; ti < hdr->n_tensors; ti++) {
                     if (tens[ti].segment_id) {
                         g_dsp_ctx->batch_tensor_needs_inval[ti] = 1;
                     }
                 }
+                if (profile_va) {
+                    g_dsp_ctx->dsp_va_profile_tensor_mark_us += (uint64_t)(ggml_time_us() - mark_t0);
+                }
+                const int64_t wakeup_t0 = profile_va ? ggml_time_us() : 0;
                 dsp_queues_wakeup();
+                if (profile_va) {
+                    g_dsp_ctx->dsp_va_profile_wakeup_us += (uint64_t)(ggml_time_us() - wakeup_t0);
+                    g_dsp_ctx->dsp_va_profile_transition_us += (uint64_t)(ggml_time_us() - transition_t0);
+                }
             }
             for (int k = 0; k < HTP_OP_MAX_INPUTS + HTP_OP_MAX_OUTPUTS; k++) {
                 int32_t ti = k < HTP_OP_MAX_INPUTS ? op->src_idx[k] : op->dst_idx[k - HTP_OP_MAX_INPUTS];
@@ -2782,6 +2802,14 @@ AEEResult ggml_htp_execute_batch(remote_handle64 h, uint32_t batch_offset, uint3
              (unsigned long long) (g_dsp_ctx->nonop_queue_us / nbc));
     }
 #endif
+
+    if (g_dsp_ctx->dsp_va_profile_enabled) {
+        g_dsp_ctx->dsp_va_profile_batches++;
+        if (g_dsp_ctx->dsp_va_profile_batches == 1 ||
+            (g_dsp_ctx->dsp_va_profile_batches % 16u) == 0u) {
+            dsp_va_profile_dump(g_dsp_ctx, "periodic");
+        }
+    }
 
     return AEE_SUCCESS;
 }
