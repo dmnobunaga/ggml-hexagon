@@ -824,3 +824,43 @@ flags and enough available memory. Report `effective_ngl`,
 `dsp_weight_segments`, `dsp_segment_slot_*`, performance and
 last same-context `[DSP-VA-PROF]` pair. No allocator or LRU code
 changes yet; profiler/debug data are needed to establish mechanism.
+
+### 1024-MiB segmentation repeatability and reserve isolation
+
+Additional user-reported Spark-X2.5-4B BF16 `-ngl 22`,
+`-p 16 -n 16 -r 1`, explicit mmap, VA window 3072 MiB,
+profiler enabled:
+
+| SEGMENT_MB | MEMORY_RESERVE_MB | PP16 (t/s) | TG16 (t/s) |
+| ---: | ---: | ---: | ---: |
+| 512 | 1536 | 5.44 | 4.57 |
+| 512 | 1536 | 3.86 | 4.22 |
+| 1024 | 2536 | 9.66 | 4.30 |
+| 1024 | 2536 | 9.30 | ~4.30 |
+| 1024 | 2536 | 9.01 | ~4.30 |
+| 1024 | 1536 | 8.63 | 4.34 |
+
+The two additional 1024/2536 PP16 samples and approximate TG16
+values were reported retrospectively by the operator. The four
+1024-MiB PP16 measurements have mean **9.15 t/s**
+(range 8.63..9.66), versus a two-run 512-MiB mean
+**4.65 t/s** (range 3.86..5.44). In the direct same-reserve
+3072-MiB comparison, 1024/1536 gave 8.63 vs 512/1536
+5.44 t/s (+58.6%). These runs were not interleaved or controlled
+for clock, thermal or available-memory conditions and may not
+have identical effective NGL or actual allocated segment layout,
+which were not supplied for the new 1024 run.
+
+Source code establishes that `SEGMENT_MB` affects weight
+tensor grouping, while `MEMORY_RESERVE_MB` changes guard
+thresholds rather than reserving physical RAM. The repeatability
+strengthens the packing hypothesis without proving causality.
+TG16 at 1024-MiB segmentation remained ~4.30..4.34 t/s.
+
+**Next:** capture `effective_ngl`, `dsp_weight_segments`,
+the `dsp_segment_slot_*` summary and one same-context
+`[DSP-VA-PROF]` snapshot for 1024/1536.
+Then alternate 512/1024 under fixed reserve=1536, VA=3072
+with matched workload and guard enabled; compare maps/evictions
+per completed DSP batch and cumulative transition timing before
+changing the allocator or eviction policy.
