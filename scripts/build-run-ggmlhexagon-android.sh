@@ -28,10 +28,10 @@ VERBOSE=OFF
 VERBOSE=ON
 
 #running path on Android phone
-REMOTE_PATH=/data/local/tmp
+REMOTE_PATH=${GGML_REMOTE_PATH:-/data/local/tmp}
 
 #path of built artifacts
-LOCAL_BUILD_DIR=${PROJECT_ROOT_PATH}/out/ggmlhexagon-android
+LOCAL_BUILD_DIR=${GGML_LOCAL_BUILD_DIR:-${PROJECT_ROOT_PATH}/out/ggmlhexagon-android}
 
 TOOLCHAIN_PATH=${PROJECT_ROOT_PATH}/prebuilts
 
@@ -355,6 +355,38 @@ function check_and_download_ndk()
 }
 
 
+# Same LunarG SDK/version as build-run-ggmlvulkan-android.sh.
+function check_and_download_vulkan_sdk()
+{
+    local version=1.4.304.1
+    local filename="vulkansdk-linux-x86_64-${version}.tar.xz"
+    local sdk_root="${TOOLCHAIN_PATH}/Vulkan_SDK"
+    local sdk_home="${VULKAN_SDK:-${sdk_root}/${version}/x86_64}"
+    local sdk_url="https://sdk.lunarg.com/sdk/download/${version}/linux/${filename}"
+
+    if [ ! -x "${sdk_home}/bin/glslc" ] || [ ! -d "${sdk_home}/share/cmake/SPIRV-Headers" ]; then
+        mkdir -p "${sdk_root}"
+        if [ ! -s "${sdk_root}/${filename}" ]; then
+            wget --no-config --quiet --show-progress -O "${sdk_root}/${filename}" "${sdk_url}"
+        fi
+        tar -xJf "${sdk_root}/${filename}" -C "${sdk_root}"
+        sdk_home="${sdk_root}/${version}/x86_64"
+    fi
+
+    if [ ! -x "${sdk_home}/bin/glslc" ] || [ ! -f "${sdk_home}/include/vulkan/vulkan.hpp" ] ||
+       [ ! -d "${sdk_home}/share/cmake/SPIRV-Headers" ]; then
+        echo "Vulkan SDK incomplete: ${sdk_home}" >&2
+        exit 1
+    fi
+
+    export VULKAN_SDK="${sdk_home}"
+    export VULKAN_GLSLC_BIN="${sdk_home}/bin/glslc"
+    export SPIRV_HEADERS_DIR="${sdk_home}/share/cmake/SPIRV-Headers"
+    export PATH="${VULKAN_SDK}/bin:${PATH}"
+    export CMAKE_PREFIX_PATH="${VULKAN_SDK}:${CMAKE_PREFIX_PATH:-}"
+    echo "Vulkan SDK ready: ${VULKAN_SDK}"
+}
+
 #build the mempool/FastRPC-invoke ggml-hexagon backend (default)
 function build_arm64
 {
@@ -410,10 +442,21 @@ function build_arm64
     fi
 
     local extra_flags="${arm_cpu_flags} ${pgo_flags}"
+    local vulkan_cmake_args=()
+    if [ "${GGML_HYBRID_VULKAN:-0}" = "1" ]; then
+        extra_flags="${extra_flags} -I${VULKAN_SDK}/include"
+        vulkan_cmake_args=(
+            -DGGML_VULKAN=ON
+            "-DVulkan_INCLUDE_DIR=${VULKAN_SDK}/include"
+            "-DVulkan_LIBRARY=${NDK_TOOLCHAIN_SYSROOT_ARM64_LIB_PATH}/34/libvulkan.so"
+            "-DVulkan_GLSLC_EXECUTABLE=${VULKAN_GLSLC_BIN}"
+            "-DSPIRV-Headers_DIR=${SPIRV_HEADERS_DIR}"
+        )
+    fi
 
     /bin/cp -fv ${PROJECT_ROOT_PATH}/docs/backend/snapdragon/CMakeUserPresets.json .
 
-    cmake -H. -B${LOCAL_BUILD_DIR} -DCMAKE_BUILD_TYPE=Release -DGGML_OPENMP=OFF -DGGML_OPENCL=OFF -DGGML_CCACHE=ON -DCMAKE_TOOLCHAIN_FILE=${ANDROID_NDK}/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=latest -DGGML_HEXAGON=ON -DLLAMA_CURL=OFF -DGGML_LLAMAFILE=ON -DGGML_HEXAGON_USE_MEMPOOL=ON -DHEXAGON_SDK_ROOT=${HEXAGON_SDK_PATH} -DHEXAGON_TOOLS_ROOT=${HEXAGON_TOOLS_PATH} -DCMAKE_C_FLAGS="${extra_flags}" -DCMAKE_CXX_FLAGS="${extra_flags}" -DCMAKE_VERBOSE_MAKEFILE:BOOL=${VERBOSE} -DGGML_USE_HEXAGON=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=ON -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_SUBPROCESS=ON --preset arm64-android-snapdragon-release
+    cmake -H. -B${LOCAL_BUILD_DIR} -DCMAKE_BUILD_TYPE=Release -DGGML_OPENMP=OFF -DGGML_OPENCL=OFF -DGGML_CCACHE=ON -DCMAKE_TOOLCHAIN_FILE=${ANDROID_NDK}/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=latest -DGGML_HEXAGON=ON -DLLAMA_CURL=OFF -DGGML_LLAMAFILE=ON -DGGML_HEXAGON_USE_MEMPOOL=ON -DHEXAGON_SDK_ROOT=${HEXAGON_SDK_PATH} -DHEXAGON_TOOLS_ROOT=${HEXAGON_TOOLS_PATH} -DCMAKE_C_FLAGS="${extra_flags}" -DCMAKE_CXX_FLAGS="${extra_flags}" -DCMAKE_VERBOSE_MAKEFILE:BOOL=${VERBOSE} "${vulkan_cmake_args[@]}" -DGGML_USE_HEXAGON=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=ON -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_SUBPROCESS=ON --preset arm64-android-snapdragon-release
     cmake --build ${LOCAL_BUILD_DIR}
     #upload the new libggml-htp.so (mempool variant) on device side
     prepare_fastrpc_skels
@@ -424,6 +467,7 @@ function build_arm64
     commit_so_file_md5 ${LOCAL_BUILD_DIR}/bin/libggml-cpu.so
     if [ -f ${LOCAL_BUILD_DIR}/bin/libggml-hexagon.so ]; then
         commit_so_file_md5 ${LOCAL_BUILD_DIR}/bin/libggml-hexagon.so
+        if [ "${GGML_HYBRID_VULKAN:-0}" != "1" ]; then
         # backup for AB testing: mempool(FastRPC) AP-side libs + DSP skels
         # libggml-hexagon.so leaks different libc++ symbols between the mempool/dspqueue
         # variants, so all transitively-linked libs (libggml, libllama, libllama-common,
@@ -444,6 +488,7 @@ function build_arm64
         # libggml-opencl.so is optional (GGML_OPENCL=OFF by default); back up if present
         if [ -f ${LOCAL_BUILD_DIR}/bin/libggml-opencl.so ]; then
             /bin/cp -fv ${LOCAL_BUILD_DIR}/bin/libggml-opencl.so ${PROJECT_ROOT_PATH}/out/ab-test/libggml-opencl-fastrpc.so
+        fi
         fi
     fi
     show_pwd
@@ -566,8 +611,14 @@ function build_ggml_hexagon()
     check_and_download_ndk
     check_and_download_opencl_sdk
     check_and_download_hexagon_sdk
+    if [ "${GGML_HYBRID_VULKAN:-0}" = "1" ]; then
+        check_and_download_vulkan_sdk
+        adb shell "mkdir -p '${REMOTE_PATH}'"
+    fi
     dump_vars
-    remove_temp_dir
+    if [ "${GGML_HYBRID_VULKAN:-0}" != "1" ] || [ "${CLEAN_BUILD:-0}" = "1" ]; then
+        remove_temp_dir
+    fi
     rm -f ${LOCAL_BUILD_DIR}/.ab_test_runtime
     build_arm64
 }
@@ -770,6 +821,13 @@ function update_ggml_libs()
     #libggml-hexagon.so only exists in hexagon builds, not in CPU-only builds
     if [ -f ${LOCAL_BUILD_DIR}/bin/libggml-hexagon.so ]; then
         adb push ${LOCAL_BUILD_DIR}/bin/libggml-hexagon.so          ${REMOTE_PATH}/
+    fi
+    if [ "${GGML_HYBRID_VULKAN:-0}" = "1" ]; then
+        if [ ! -f "${LOCAL_BUILD_DIR}/bin/libggml-vulkan.so" ]; then
+            echo "Hybrid build missing libggml-vulkan.so" >&2
+            exit 1
+        fi
+        adb push "${LOCAL_BUILD_DIR}/bin/libggml-vulkan.so" "${REMOTE_PATH}/"
     fi
     #libggml-opencl.so is optional (GGML_OPENCL=OFF by default)
     if [ -f ${LOCAL_BUILD_DIR}/bin/libggml-opencl.so ]; then

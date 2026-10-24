@@ -18,20 +18,17 @@ With `GGML_HEXAGON_HYBRID_VULKAN=1`, select exactly **HTP first, Vulkan second**
 Existing Android NDK, Qualcomm Hexagon SDK and LunarG SDK required on the Linux build host:
 
 ```bash
-export ANDROID_NDK_ROOT=/path/to/android-ndk-r29
-export HEXAGON_SDK_ROOT=/path/to/Hexagon_SDK
-export HEXAGON_TOOLS_ROOT=/path/to/hexagon_tools
-export VULKAN_SDK=/path/to/Vulkan_SDK/1.4.304.1/x86_64
+# Reuses the existing NDK / Hexagon SDK download and deployment pipeline:
 ./scripts/build-run-ggmlhybrid-android.sh build
-./scripts/build-run-ggmlhybrid-android.sh push
+./scripts/build-run-ggmlhybrid-android.sh devices
 ```
 
-No existing `out/ggmlhexagon-android` or `/data/local/tmp` runtime files are replaced. The hybrid runtime is uploaded to `/data/local/tmp/ggml-hybrid`.
+The wrapper calls the existing `build-run-ggmlhexagon-android.sh` for NDK/Hexagon setup, FastRPC skel generation and synchronized AP deployment; it downloads the same LunarG SDK as the Vulkan-only script and adds `-DGGML_VULKAN=ON`. It does not overwrite the known-good `out/ggmlhexagon-android`, `out/ab-test`, or `/data/local/tmp` files. Hybrid artifacts use `out/ggmlhybrid-android` and `/data/local/tmp/ggml-hybrid`.
 
 Verify both devices before loading a model:
 
 ```bash
-adb shell 'cd /data/local/tmp/ggml-hybrid && LD_LIBRARY_PATH=/data/local/tmp/ggml-hybrid ./llama-bench --list-devices'
+./scripts/build-run-ggmlhybrid-android.sh devices
 ```
 
 For the first smoke test, replace `HTP0,Vulkan0` with the names actually printed by `--list-devices`:
@@ -40,6 +37,7 @@ For the first smoke test, replace `HTP0,Vulkan0` with the names actually printed
 adb shell '
 cd /data/local/tmp/ggml-hybrid
 export LD_LIBRARY_PATH=/data/local/tmp/ggml-hybrid
+export ADSP_LIBRARY_PATH=/data/local/tmp/ggml-hybrid
 export GGML_HEXAGON_SEGMENTED_RPCMEM=1
 export GGML_HEXAGON_ADAPTIVE_OFFLOAD=1
 export GGML_HEXAGON_SEGMENT_MB=1024
